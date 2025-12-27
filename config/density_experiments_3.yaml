@@ -1,0 +1,72 @@
+#./train.py --multirun hydra/launcher=slurm 
+
+defaults:
+  - data: data_set
+  - task: density # density, forecast
+  - hydra: default
+  
+  # Allow the model to overwrite the settings below
+  - _self_
+  - model: add_thin
+
+optimization:
+  optimizer_type: Adam
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: gpu
+  max_epochs: 5000
+  log_every_n_steps: 1
+  resume_from_checkpoint: ~
+  check_val_every_n_epoch: 100
+  gradient_clip_val: 2.
+  gradient_clip_algorithm: value
+
+seed: 135398
+eval_testset: no
+
+id: ~
+entity: ~
+project: add_thin_density
+group: ~
+mode: ~
+name: ~
+run_dir: ~
+
+early_stopping: 20
+
+# dataset specific hyperparameter setting
+task.learning_rate: 0.01
+model.mix_components: 16
+
+# run all seeds and dataset
+hydra:
+  job:
+      name: ${project}
+  sweeper:
+    params:
+      seed: int(9591415),int(135398),int(428227),int(206247),int(687906)
+      data.name: stationary_renewal
+    
+
+# optimal setting from hyperparameter search
+# 8, 0.01
+# - hawkes2
+# - reddit_politics_submissions
+# - reddit_askscience_comments
+# - yelp_mississauga
+# - yelp_airport
+# - taxi
+
+# 8, 0.001
+# - nonstationary_renewal
+# - pubg
+# - twitter
+
+# 16, 0.01
+# - stationary_renewal
+
+# 16, 0.001
+# - self_correcting
+# - nonstationary_poisson
+# - hawkes1

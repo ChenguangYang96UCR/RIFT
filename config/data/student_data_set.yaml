@@ -1,0 +1,4 @@
+root: notebooks/
+batch_size: 64
+name: stored_pair
+t_max: stored_t_max
