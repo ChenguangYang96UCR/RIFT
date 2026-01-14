@@ -87,7 +87,7 @@ class TimestepEmbedder(nn.Module):
     def forward(self, t):
         x = self.timestep_embedding(t)
         x = self.mlp(x)
-        return x
+        return x.unsqueeze(0)    # → (1, hidden_size) 
     
     def timestep_embedding(self, t, max_period=10000):
         """
@@ -100,8 +100,58 @@ class TimestepEmbedder(nn.Module):
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
         )
         args = t[:, None] * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        embedding = torch.cat([torch.cos(args).mean(dim=0), torch.sin(args).mean(dim=0)], dim=-1)
         return embedding
+
+class EventEmbedder(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        frequency_embedding_size: int = 256,
+        max_period: int = 10000,
+    ):
+        super().__init__()
+        self.frequency_embedding_size = frequency_embedding_size
+        self.max_period = max_period
+
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+        nn.init.normal_(self.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.mlp[2].weight, std=0.02)
+
+    def forward(self, e):
+        # event_embedding returns shape (frequency_embedding_size,)
+        emb = self.event_embedding(e)   # (D,)
+        emb = self.mlp(emb)             # (hidden_size,)
+        return emb.unsqueeze(0)         # → (1, hidden_size)
+
+    def event_embedding(self, e):
+        """
+        e: shape (N,)
+        Returns a single embedding vector: shape (frequency_embedding_size,)
+        """
+        e = e.float()
+        dim = self.frequency_embedding_size
+        half = dim // 2
+
+        freqs = torch.exp(
+            -math.log(self.max_period)
+            * torch.arange(half, device=e.device) / half
+        )
+
+        args = e[:, None] * freqs[None]   # → (N, half)
+
+        # Pool over the event dimension
+        cos_part = torch.cos(args).mean(dim=0)  # (half,)
+        sin_part = torch.sin(args).mean(dim=0)  # (half,)
+
+        # Final freq embedding: (frequency_embedding_size,)
+        return torch.cat([cos_part, sin_part], dim=-1)
+    
 
 class LabelEmbedder(nn.Module):
     """
@@ -194,6 +244,12 @@ class DiTBlock(nn.Module):
         xavier_uniform_init(self.adaLN_modulation[1].weight)
 
     def forward(self, x, c):
+
+        # x: (B, C) → (B, 1, C)
+        # if x.dim() == 2:
+        #     print(f'x need to unsqueeze')
+        #     x = x.unsqueeze(1)
+        print(f"DiTBlock: x shape is {x.shape}")
         # Calculate adaLN modulation parameters
         adaLN_out = self.adaLN_modulation(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaLN_out.chunk(6, dim=1)
@@ -202,6 +258,8 @@ class DiTBlock(nn.Module):
         x_norm = self.norm1(x)
         x_modulated = modulate(x_norm, shift_msa, scale_msa)
         
+        print(f"DiTBlock: x modulated shape is : {x_modulated.shape}")
+        print(f"DiTBlock: c shape is : {c.shape}")
         B, N, C = x_modulated.shape
         qkv = self.qkv(x_modulated).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -222,6 +280,9 @@ class DiTBlock(nn.Module):
         mlp_out = self.mlp(x_modulated2)
         
         x = x + gate_mlp.unsqueeze(1) * mlp_out
+
+        # (B, 1, C) → (B, C)
+        x = x.squeeze(1)
         return x
 
 class FinalLayer(nn.Module):
@@ -427,6 +488,7 @@ class AddThin(DiffusionModell):
         self.patch_embed = PatchEmbed(patch_size, hidden_size)
         self.time_embed = TimestepEmbedder(hidden_size)
         self.dt_embed = TimestepEmbedder(hidden_size)
+        self.event_embed = EventEmbedder(hidden_size)
 
         num_patches = (input_size // patch_size) ** 2
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -552,7 +614,7 @@ class AddThin(DiffusionModell):
         self.history = embedding.gather(1, gather_index).squeeze(-2)
 
     def compute_emb(
-        self, n: TensorType[torch.long, "batch"], x_n: Batch
+        self, n: TensorType[torch.long, "batch"], x_n: Tuple
     ) -> Tuple[
         TensorType["batch", "embedding"],
         TensorType["batch", "sequence", "embedding"],
@@ -565,8 +627,8 @@ class AddThin(DiffusionModell):
         ----------
         n : TensorType[torch.long, "batch"]
             Diffusion time step
-        x_n : Batch
-            Batch of data
+        x_n : Tuple
+              [e_rk, sequence_length, mask, x_0 tau]
 
         Returns
         -------
@@ -577,7 +639,7 @@ class AddThin(DiffusionModell):
         ]
             Diffusion time embedding, event time embedding, event sequence embedding
         """
-        B, L = x_n.batch_size, x_n.seq_len
+        B, L = x_n[0].shape[0], x_n[0].shape[1]
         print(f"L value: {L}")
 
         # embed diffusion and process time
@@ -590,13 +652,14 @@ class AddThin(DiffusionModell):
             )
 
         # Embed event and interevent time
+        # TODO: think how to get the interevent tau value
         time_emb = self.time_encoder(
-            torch.cat([x_n.time.unsqueeze(-1), x_n.tau.unsqueeze(-1)], dim=-1)
+            torch.cat([x_n[0].unsqueeze(-1), x_n[2].unsqueeze(-1)], dim=-1)
         ).reshape(B, L, -1)
 
         # Embed event sequence and mask out
         event_emb = self.sequence_encoder(time_emb)
-        event_emb = event_emb * x_n.mask[..., None]
+        event_emb = event_emb * x_n[2][..., None]
 
         return (
             dif_time_emb,
@@ -667,15 +730,8 @@ class AddThin(DiffusionModell):
         return x_n, x_0_thinned
 
     def DiT(self, x, t, dt, train=False, return_activations=False):
-        # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
-        real_patch = int(self.number_patches ** 0.5)
-        print(f"num_pathcs is {self.number_patches}, real_path is {real_patch}")
-        assert real_patch * real_patch == self.number_patches
         activations = {}
-
-        batch_size = x.shape[0]
-        input_size = x.shape[1]
-        data_length = x.shape[1] * x.shape[2]
+        data_length = x.shape[0]
         
         # Ensure all tensors are on the same device
         device = x.device
@@ -686,20 +742,24 @@ class AddThin(DiffusionModell):
         if not isinstance(dt, torch.Tensor):
             dt = torch.tensor(dt, device=device, dtype=torch.float32)
         
-        # Get positional embeddings
-        pos_embed = get_2d_sincos_pos_embed(None, self.hidden_size, self.number_patches, device=device)
-        pos_embed = pos_embed.to(x.dtype)
         activations['patch_embed'] = x
-
-        # Add positional embeddings
-        x = x + pos_embed
         
         # Get timestep embeddings
-        te = self.time_embed(t)  # (B, hidden_size)
-        dte = self.dt_embed(dt)  # (B, hidden_size)
+        # TODO exchange shape from (sequence, embeding) to (sequence, )
+        print(f"DiT: before embed x shape is {x.shape}")
+        e = x.mean(dim=-1)          # (sequence,)
+        x = self.event_embed(e)  # (B, hidden_size)
+        print(f"DiT: after embed x shape is {x.shape}")
+        print(f"DiT: before embed t shape is {t.shape}")
+        t_mean = t.mean(dim=-1)
+        te = self.time_embed(t_mean)  # (B, hidden_size)
+        print(f"DiT: after embed t shape is {t.shape}")
+        print(f"DiT: before embed dtt shape is {dt.shape}")
+        dt_mean = dt.mean(dim=-1)
+        dte = self.dt_embed(dt_mean)  # (B, hidden_size)
         c = te + dte
         
-        activations['pos_embed'] = pos_embed
+        # activations['pos_embed'] = pos_embed
         activations['time_embed'] = te
         activations['dt_embed'] = dte
         activations['conditioning'] = c
@@ -715,16 +775,6 @@ class AddThin(DiffusionModell):
         x = self.final_layer(x, c)  # (B, num_patches, p*p*c)
         activations['final_layer'] = x
         
-        # Reshape to image format
-        x = x.reshape(batch_size, real_patch, real_patch, self.patch_size, self.patch_size, 1)
-        x = x.permute(0, 1, 3, 2, 4, 5)  # Equivalent to einsum 'bhwpqc->bhpwqc'
-        x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C', H=int(real_patch), W=int(real_patch))
-        
-        assert x.shape == (batch_size, input_size, input_size, 1), f"x shape is {x.shape}, expected ({batch_size}, {input_size}, {input_size}, 1)"
-
-        # Create logvar embeddings
-        t_discrete = torch.floor(t * 256).long()
-        logvars = self.logvar_embed(t_discrete) * 100
 
         # Flatten for MLP processing
         print(f"Before DiT MLP shape {x.shape}")
@@ -737,81 +787,131 @@ class AddThin(DiffusionModell):
             mlp.train()
         else:
             mlp.eval()
-            
-        e_new = mlp(x_flat)
         
-        if return_activations:
-            return e_new, logvars, activations
-        return e_new
+        e_new = mlp(x_flat)
 
-    def scaled_sampling(self, k, lambda_1, e_0, e_bar, T, r_k, r_k1, gap = 0.1):
-        bandwidth_square = 1.5
-        batch_size = e_0.shape[0]
-        print(f"scaled sampling batch size {batch_size}")
-        T = T.detach().cpu().numpy()
-        e_0 = e_0.detach().cpu().numpy()
-        if isinstance(e_bar, torch.Tensor):
-            e_bar = e_bar.detach().cpu().numpy()
+        print(f"DiT: e_new shape is {e_new.shape}")
 
-        def lambda_0_hat(e_bar, e_0, bandwidth_square):
+        scalar = e_new.mean(dim=1).mean()
+
+        print(f"DiT: scalar shape is {scalar.shape}")
+        
+        return scalar
+
+    def lambda_0_hat(e_bar, e_0, bandwidth_square):
             print(f"before kernel values, e_bar {e_bar.reshape(-1, 1).shape}, e_0 {e_0.reshape(1, -1).shape}")
             kernel_values = np.exp(-((e_bar.reshape((-1, 1)) - e_0.reshape((1, -1))) **2 ) / (bandwidth_square))
             return np.sum(kernel_values, axis = 1) / len(e_0)
 
-        def lambda_0_hat_kmeans(e_bar, e_0, bandwidth_square, n_clusters=1000):
-            # cluster e_0
-            kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto").fit(e_0.reshape(-1, 1))
-            centroids = kmeans.cluster_centers_.reshape(-1)   # shape (n_clusters,)
-            counts = np.bincount(kmeans.labels_)              # cluster weights
+    def scaled_sampling_batchwise(
+        self,
+        k,
+        lambda_1,
+        e_0,        # [B, L]
+        e_bar,      # [B, L] or None
+        T,
+        r_k,
+        r_k1,
+        gap=0.1,
+        bandwidth_square=1.5,
+        n_clusters=50,
+    ):
+        """
+        Batch-safe scaled sampling.
+        Input:
+            e_0   : [B, L]
+        Output:
+            e_r   : [B, L]
+        """
 
-            # compute kernel vs centroids
-            diff = e_bar.reshape(-1, 1) - centroids.reshape(1, -1)
-            kernel_values = np.exp(-(diff**2) / bandwidth_square)
+        # Initialize parameter
+        e_0 = e_0.detach().cpu().numpy()
+        B, L = e_0.shape
 
-            # weighted average
-            weighted = kernel_values @ counts
-            return weighted / len(e_0)
-
-        # calculating the ratio of omega_bar_t
-        kernel_approx_e0_inputs = lambda_0_hat_kmeans(e_bar, e_0, bandwidth_square)
-        omega_bar_thinning = (lambda_1 ** (r_k-r_k1))*((kernel_approx_e0_inputs) ** (r_k1-r_k))
-
-        # reshape omega_bar from [total_length] to [batch_size, -1]
-        pad_len = (batch_size - (omega_bar_thinning.shape[0] % batch_size)) % batch_size
-        if pad_len > 0:
-            omega_bar_thinning = np.pad(omega_bar_thinning, (0, pad_len), mode="constant", constant_values=0)
-        omega_bar_thinning = omega_bar_thinning.reshape(batch_size, -1)
-        keeping_judge = (np.random.rand(batch_size)[:, None] < (omega_bar_thinning))
-        print(f"keeping judge shape {keeping_judge.shape}, e_bar shape {e_bar.shape}")
-
-        target_len = keeping_judge.size
-        if e_bar.size < target_len:
-            # pad with zeros
-            e_bar_resized = np.pad(e_bar, (0, target_len - e_bar.size), mode="constant")
+        if e_bar is None:
+            e_bar = e_0.copy()
         else:
-            # truncate
-            e_bar_resized = e_bar[:target_len]
+            e_bar = e_bar.detach().cpu().numpy()
 
-        # Step 2: reshape to b's shape
-        e_bar = e_bar_resized.reshape(keeping_judge.shape)
+        T = float(T)
 
-        e_thinning_left = e_bar[keeping_judge]
+        def lambda_0_hat_kmeans(e_query, e_ref):
+            n_c = min(n_clusters, len(e_ref))
+            kmeans = KMeans(n_clusters=n_c, n_init="auto", random_state=0)
+            kmeans.fit(e_ref.reshape(-1, 1))
 
-        # event adding through rejection sampling
-        # roughly estimate an upper bound of the function difference upper_b = max_t lambda_bar*omega_bar - lambda_bar
-        upper_b = 2 * np.max((lambda_1 ** (k * gap)) * (omega_bar_thinning ** (1 - (k * gap)))) + 2
+            centroids = kmeans.cluster_centers_.reshape(-1)
+            counts = np.bincount(kmeans.labels_)
 
-        # uniformly generate new candidate events points
-        e_candidate_adding = np.random.rand(np.random.poisson(upper_b * T)) * T
+            diff = e_query.reshape(-1, 1) - centroids.reshape(1, -1)
+            kernel = np.exp(-(diff ** 2) / bandwidth_square)
 
-        kernel_approx_e_candidate_adding_inputs = lambda_0_hat_kmeans(e_candidate_adding, e_0, bandwidth_square)
-        omega_bar_adding = (lambda_1**(r_k-r_k1))*((kernel_approx_e_candidate_adding_inputs)**(r_k1-r_k))
-        lambda_bar_adding = (lambda_1**(r_k1))*((kernel_approx_e_candidate_adding_inputs)**(1-r_k1))
+            return (kernel @ counts) / len(e_ref)
 
-        keeping_judge = (np.random.rand(len(e_candidate_adding)) < ((omega_bar_adding-1)*lambda_bar_adding))
-        e_adding = e_candidate_adding[keeping_judge]
-        e_new = np.concatenate((e_thinning_left, e_adding))
-        return e_new
+        batch_results = []
+
+        for b in range(B):
+            e0_b = e_0[b]
+            ebar_b = e_bar[b]
+
+            # thin
+            lambda0_hat = lambda_0_hat_kmeans(ebar_b, e0_b)
+
+            omega_bar = (
+                (lambda_1 ** (r_k - r_k1)) *
+                (lambda0_hat ** (r_k1 - r_k))
+            )
+
+            keep_mask = np.random.rand(ebar_b.shape[0]) < omega_bar
+            e_thin = np.where(keep_mask, ebar_b, 0.0)
+
+            # add
+            upper_b = (
+                2 * np.max(
+                    (lambda_1 ** (k * gap)) *
+                    (omega_bar ** (1 - k * gap))
+                ) + 2
+            )
+
+            n_add = np.random.poisson(upper_b * T)
+            if n_add > 0:
+                e_candidate = np.random.rand(n_add) * T
+
+                lambda0_hat_add = lambda_0_hat_kmeans(e_candidate, e0_b)
+
+                omega_add = (
+                    (lambda_1 ** (r_k - r_k1)) *
+                    (lambda0_hat_add ** (r_k1 - r_k))
+                )
+
+                lambda_bar_add = (
+                    (lambda_1 ** r_k1) *
+                    (lambda0_hat_add ** (1 - r_k1))
+                )
+
+                accept = np.random.rand(n_add) < ((omega_add - 1) * lambda_bar_add)
+                e_add = e_candidate[accept]
+            else:
+                e_add = np.array([])
+
+            merged = np.sort(np.concatenate([e_thin[e_thin > 0], e_add]))
+            batch_results.append(merged)
+
+        # ===== Pad to max length across batch =====
+        lengths = np.array([len(x) for x in batch_results], dtype=np.int64)
+        max_len = max(len(x) for x in batch_results)
+
+        e_r = np.zeros((B, max_len), dtype=np.float32)
+        event_mask = np.zeros((B, max_len), dtype=bool)
+        for b, seq in enumerate(batch_results):
+            e_r[b, :len(seq)] = seq
+            event_mask[b, :len(seq)] = True
+
+        sequence_length = torch.from_numpy(lengths)
+        event_mask = torch.from_numpy(event_mask)
+
+        return torch.from_numpy(e_r), sequence_length, event_mask
+    
 
     def approximate_lambda_0_hat(self, k_steps, lambda_1, e_rk_array):
         """
@@ -852,60 +952,70 @@ class AddThin(DiffusionModell):
             classification logits, log likelihood of x_0 without x_n, noised data
         """
         # Uniformly sample n
+        print(f"x_0 is {x_0}")
+        print(f"x_0 time shape is {x_0.time.shape}")
+        print(f"x_0 mask shape is {x_0.mask.shape}")
+        device = x_0.time.device
         n = self.get_n(
             min=0,
             max=self.steps,
             shape=(len(x_0),),
-            device=x_0.time.device,
+            device=device,
         )
         
         # Initialize the sample parameter
         r_k = 0.1
         r_k1 = r_k - (1/self.k_steps)
-        e_rk1 = x_0.time
+        
+        e_rk1 = x_0.time * x_0.mask
         e_new = []
-        e_0 = x_0.time
+        time = []
+        e_0 = x_0.time * x_0.mask
         batch_size = e_0.shape[0]
+
         # noise the event
         for i in range(1, self.k_steps): 
-            e_rk = self.scaled_sampling(i, self.lambda_1, e_0, e_rk1, x_0.tmax, r_k, r_k1)
+            e_rk, sequence_length, mask = self.scaled_sampling_batchwise(i, self.lambda_1, e_0, e_rk1, x_0.tmax, r_k, r_k1)
             e_rk1 = e_rk
-            e_new.append(e_rk)
+            # e_new.append(e_rk)
             print(f"e_rk shape is {e_rk.shape}")
+
+            # Generate event embeding 
+            (dif_time_emb, time_emb, event_emb) = self.compute_emb(n=n, x_n=(e_rk.to(device), sequence_length.to(device), mask.to(device), x_0.tau.to(device)))
+            e_new.append(event_emb)
+            print(f"event_emb shape is {event_emb.shape}")
+            time.append(time_emb)
+            print(f"time_emb shape is {time_emb.shape}")
+
         print(f"e_new data length: {len(e_new)}")
+        print(f"time data length : {len(time)}")
 
         e_rk_array = []
-        for e in e_new:
-            e = torch.from_numpy(e).to(torch.float32).to(x_0.time.device)
-            
-            # reshape e from [data_len, ] to [batch, data]
-            pad_len = (batch_size - (e.numel() % batch_size)) % batch_size
-            print(f"MLP forward L % self.number_patches: {e.numel() % batch_size}, (self.number_patches - (L % self.number_patches)): {(self.number_patches - (e.numel() % self.number_patches))} pad_len: {pad_len}")
-            if pad_len > 0:
-                e = F.pad(e, (0, pad_len), mode="constant", value=0)
-            e = e.view(batch_size, -1)
-            B, L = e.shape
-            pad_len = (self.number_patches - (L % self.number_patches)) % self.number_patches
-            seq_len = L
-            if pad_len > 0:
-                seq_len = seq_len + pad_len
-            
-            model = MLP(int(seq_len // self.number_patches), self.hidden_size, hidden=self.hidden_size).to(e.device)
-            y = model(e, number_patches=self.number_patches)
 
-            # Generate random timesteps using PyTorch instead of JAX
-            t = torch.rand(y.shape[0], device=y.device)
-            dt = torch.rand(y.shape[0], device=y.device)
-            
-            result = self.DiT(y, t, dt)
-            print(f" DiT result shape: ", result.shape) 
-            e_rk_array.append(result)
+        # For each step
+        for index, e in enumerate(e_new):
+            e_batch_array = []
+            for batch_index in range(batch_size):
+                batch_e = e[batch_index].to(torch.float32).to(device)
+
+                # Generate random timesteps using PyTorch instead of JAX
+                # t = torch.rand(self.hidden_size, device=e.device)
+                # TODO step mlp
+                dt = torch.rand(time[index][batch_index].shape[0], time[index][batch_index].shape[1], device=batch_e.device)
+
+                result = self.DiT(batch_e, time[index][batch_index], dt)
+                print(f" DiT result shape: ", result.shape)  
+                e_batch_array.append(result)
+            e_rk_array.append(e_batch_array)
 
         # calculate approximate lambda_0 hat
-        print(f"forward e_rk array length {len(e_rk_array)}, stack array length {torch.stack(e_rk_array).shape}")
-        lambda_0_hat = self.approximate_lambda_0_hat(self.k_steps, self.lambda_1, torch.stack(e_rk_array))
+        print(f"e_rk_array length is {len(e_rk_array)}, each element length is {len(e_rk_array[0])}")
+        # print(f"forward e_rk array length {len(e_rk_array)}, stack array length {torch.stack(e_rk_array).shape}")
+        lambda_0_hat = self.approximate_lambda_0_hat(self.k_steps, self.lambda_1, torch.tensor(e_rk_array))
         print(f"lambda_0_hat value is {lambda_0_hat}")
-        return torch.stack(e_rk_array), self.lambda_1, self.k_steps
+        
+        # TODO sample time and re-run DiT
+        return torch.tensor(e_rk_array), self.lambda_1, self.k_steps
 
     def sample(self, n_samples: int, tmax) -> Batch:
         """
