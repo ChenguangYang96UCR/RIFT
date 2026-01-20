@@ -1,0 +1,6 @@
+name: add-thin
+channels:
+  - defaults
+dependencies:
+  - python=3.10.4
+prefix: /home/ADS/cyang314/.conda/envs/add-thin
