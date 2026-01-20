@@ -59,12 +59,13 @@ class Tasks(pl.LightningModule):
         loss = classification + intensity
         return loss, classification, intensity
     
-    def L11_loss(self, e_rk_array, lambda_1, K, M = 100, T = 24):    
+    def L11_loss(self, result_array, lambda_1, K, sample_array, M = 100, T = 24):    
         # First term
-        term1 = e_rk_array.mean() / K
+        term1 = result_array.mean() / K
 
         # Second term
-        inner = e_rk_array.mean(dim=(1,2)) / (K ** 2) 
+        #TODO add one time sample array
+        inner = sample_array.mean(dim=1).squeeze(-1) / K
         exp_term = torch.exp(inner)
         term2 = (lambda_1 * T / M) * exp_term.mean()
         return term1 - term2
@@ -78,12 +79,12 @@ class Tasks(pl.LightningModule):
         Apply model to batch and compute loss.
         """
         # Forward pass
-        e_rk_array, lambda_1, steps = self.model.forward(batch)
-        print(f"e_rk_array length: {len(e_rk_array)}")
+        result_array, lambda_1, steps, sample_array = self.model.forward(batch)
+        print(f"result_array length: {len(result_array)}")
 
-        l11_loss = self.L11_loss(e_rk_array, lambda_1, steps)
-        mse_losses = [self.mse_loss(e_rk_array[i], e_rk_array[i + 1])
-                  for i in range(len(e_rk_array) - 1)]
+        l11_loss = self.L11_loss(result_array, lambda_1, steps, sample_array)
+        mse_losses = [self.mse_loss(result_array[i], result_array[i + 1])
+                  for i in range(len(result_array) - 1)]
         mse_loss = torch.stack(mse_losses).mean()
         
         final_loss = mse_loss - l11_loss

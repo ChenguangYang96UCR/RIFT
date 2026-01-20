@@ -1,20 +1,19 @@
-import math
-import torch
-import torch.nn as nn
-from typing import Optional
-import numpy as np
-
-from typing import Tuple
-from torchtyping import TensorType, patch_typeguard
-from typeguard import typechecked
-
 from add_thin.data import Batch
 from add_thin.backbones.cnn import CNNSeqEmb
 from add_thin.backbones.embeddings import NyquistFrequencyEmbedding
 from add_thin.processes.hpp import generate_hpp
 from add_thin.diffusion.utils import betas_for_alpha_bar
-import torch.nn.functional as F
 from add_thin.utils.math import get_2d_sincos_pos_embed, modulate
+
+import math
+import torch
+import torch.nn as nn
+from typing import Optional
+import numpy as np
+from typing import Tuple
+from torchtyping import TensorType, patch_typeguard
+from typeguard import typechecked
+import torch.nn.functional as F
 from einops import rearrange
 import jax.numpy as jnp
 from jax._src import dtypes
@@ -22,13 +21,13 @@ from flax import linen as linen
 import jax
 from scipy.spatial.distance import cdist
 from sklearn.cluster import KMeans
-
 import math
 from typing import Any, Callable, Optional, Tuple, Type, Sequence, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+import tensorflow.compat.v1 as tf
 
 patch_typeguard()
 
@@ -102,6 +101,40 @@ class TimestepEmbedder(nn.Module):
         args = t[:, None] * freqs[None]
         embedding = torch.cat([torch.cos(args).mean(dim=0), torch.sin(args).mean(dim=0)], dim=-1)
         return embedding
+
+
+def get_timestep_embedding(timesteps, embedding_dim: int):
+    """
+    From Fairseq.
+    Build sinusoidal embeddings.
+    This matches the implementation in tensor2tensor, but differs slightly
+    from the description in Section 3.5 of "Attention Is All You Need".
+    """
+    assert timesteps.dim() == 1, "timesteps must be 1D"
+
+    device = timesteps.device
+    half_dim = embedding_dim // 2
+
+    # log(10000) / (half_dim - 1)
+    emb_scale = math.log(10000) / (half_dim - 1)
+
+    # exp(range * -scale)
+    emb = torch.exp(
+        torch.arange(half_dim, device=device, dtype=torch.float32) * -emb_scale
+    )
+
+    # timesteps[:, None] * emb[None, :]
+    emb = timesteps.to(torch.float32)[:, None] * emb[None, :]
+
+    # concat sin and cos
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+
+    # zero pad if embedding_dim is odd
+    if embedding_dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1))
+
+    assert emb.shape == (timesteps.shape[0], embedding_dim)
+    return emb
 
 class EventEmbedder(nn.Module):
     def __init__(
@@ -483,6 +516,7 @@ class AddThin(DiffusionModell):
         self.input_size = input_size
         self.k_steps = k_steps
         self.lambda_1 = lambda_1
+        self.lambda_0_hat = None
         
         # Components
         self.patch_embed = PatchEmbed(patch_size, hidden_size)
@@ -803,6 +837,10 @@ class AddThin(DiffusionModell):
             kernel_values = np.exp(-((e_bar.reshape((-1, 1)) - e_0.reshape((1, -1))) **2 ) / (bandwidth_square))
             return np.sum(kernel_values, axis = 1) / len(e_0)
 
+    def random_sample_by_interval(self, max_val=1, interval=0.01):
+        samples = np.arange(0, max_val + interval, interval)
+        return samples
+
     def scaled_sampling_batchwise(
         self,
         k,
@@ -913,22 +951,20 @@ class AddThin(DiffusionModell):
         return torch.from_numpy(e_r), sequence_length, event_mask
     
 
-    def approximate_lambda_0_hat(self, k_steps, lambda_1, e_rk_array):
+    def approximate_lambda_0_hat(self, lambda_1, e_rk_array):
         """
-        based on k_steps' sample value to approximate the lambda_0_hat
+        e_rk_array: [steps, batch, value]
+        returns:    [value]
+        """
 
-        Args:
-            steps (int): step number which used to add or thin event
-            lambda_1 (float): Given parameter 
-            e_rk_array (array): DiT result
-        """        
+        # E_batch[ · ]
+        term_k = e_rk_array.mean(dim=1)    # [steps, value]
 
-        # factor 1/K^2
-        sum_term = e_rk_array.mean() * (k_steps * k_steps) 
+        # sum over k (path integral)
+        path_integral = term_k.sum(dim=0)  # [value]
 
-        # exponentiate
-        result = lambda_1 * torch.exp(sum_term)
-        return result
+        lambda_0_hat = lambda_1 * torch.exp(path_integral)
+        return lambda_0_hat
 
 
     def forward(
@@ -965,6 +1001,7 @@ class AddThin(DiffusionModell):
         
         # Initialize the sample parameter
         r_k = 0.1
+        M = 100
         r_k1 = r_k - (1/self.k_steps)
         
         e_rk1 = x_0.time * x_0.mask
@@ -990,32 +1027,60 @@ class AddThin(DiffusionModell):
         print(f"e_new data length: {len(e_new)}")
         print(f"time data length : {len(time)}")
 
-        e_rk_array = []
+        result_rk_array = []
 
         # For each step
         for index, e in enumerate(e_new):
-            e_batch_array = []
+            batrch_result_array = []
             for batch_index in range(batch_size):
                 batch_e = e[batch_index].to(torch.float32).to(device)
 
                 # Generate random timesteps using PyTorch instead of JAX
                 # t = torch.rand(self.hidden_size, device=e.device)
                 # TODO step mlp
-                dt = torch.rand(time[index][batch_index].shape[0], time[index][batch_index].shape[1], device=batch_e.device)
-
+                # dt = torch.rand(time[index][batch_index].shape[0], time[index][batch_index].shape[1], device=batch_e.device)
+                dt = get_timestep_embedding(
+                    torch.tensor([index], device=device),
+                    self.hidden_size
+                )
                 result = self.DiT(batch_e, time[index][batch_index], dt)
                 print(f" DiT result shape: ", result.shape)  
-                e_batch_array.append(result)
-            e_rk_array.append(e_batch_array)
+                batrch_result_array.append(result)
+            result_rk_array.append(batrch_result_array)
+
+        sample_result_rk_array = []
+
+        # For each step
+        for index, e in enumerate(e_new):
+            batrch_result_array = []
+            for batch_index in range(batch_size):
+                batch_e = e[batch_index].to(torch.float32).to(device)
+
+                # Generate random timesteps using PyTorch instead of JAX
+                # t = torch.rand(self.hidden_size, device=e.device)
+                time_smaple = self.random_sample_by_interval(max_val=1)
+                time_embeding = get_timestep_embedding(torch.from_numpy(time_smaple), self.hidden_size)
+
+                # TODO step mlp
+                # dt = torch.rand(time[index][batch_index].shape[0], time_embeding, device=batch_e.device)
+                dt = get_timestep_embedding(
+                    torch.tensor([index], device=device),
+                    self.hidden_size
+                )
+                result = self.DiT(batch_e, time_embeding.to(device), dt)
+                print(f" DiT result shape: ", result.shape)  
+                batrch_result_array.append(result)
+            sample_result_rk_array.append(batrch_result_array)
 
         # calculate approximate lambda_0 hat
-        print(f"e_rk_array length is {len(e_rk_array)}, each element length is {len(e_rk_array[0])}")
+        print(f"e_rk_array length is {len(result_rk_array)}, each element length is {len(result_rk_array[0])}")
         # print(f"forward e_rk array length {len(e_rk_array)}, stack array length {torch.stack(e_rk_array).shape}")
-        lambda_0_hat = self.approximate_lambda_0_hat(self.k_steps, self.lambda_1, torch.tensor(e_rk_array))
+        lambda_0_hat = self.approximate_lambda_0_hat(self.lambda_1, torch.tensor(result_rk_array))
+        # self.lambda_0_hat = lambda_0_hat
         print(f"lambda_0_hat value is {lambda_0_hat}")
         
         # TODO sample time and re-run DiT
-        return torch.tensor(e_rk_array), self.lambda_1, self.k_steps
+        return torch.tensor(result_rk_array), self.lambda_1, self.k_steps, torch.tensor(sample_result_rk_array)
 
     def sample(self, n_samples: int, tmax) -> Batch:
         """
