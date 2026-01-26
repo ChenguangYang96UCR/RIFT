@@ -792,130 +792,70 @@ class AddThin(DiffusionModell):
         tau = tau * mask
         return tau
 
-    def scaled_sampling_batchwise(
-        self,
-        k,
-        lambda_1,
-        e_0,        # [B, L]
-        e_bar,      # [B, L] or None
-        T,
-        r_k,
-        r_k1,
-        gap=0.1,
-        bandwidth_square=1.5,
-        n_clusters=50,
-    ):
-        """
-        Batch-safe scaled sampling.
-        Input:
-            e_0   : [B, L]
-        Output:
-            e_r   : [B, L]
-        """
-
-        # Initialize parameter
+    def scaled_sampling_batchwise(self, k, lambda_1, e_0, e_bar, T, r_k, r_k1, gap=0.1, bandwidth_square=1.5):
         device = e_0.device
-        e_0 = e_0.detach().cpu().numpy()
         B, L = e_0.shape
 
         if e_bar is None:
-            e_bar = e_0.copy()
-        else:
-            e_bar = e_bar.detach().cpu().numpy()
+            e_bar = e_0
 
-        T = float(T)
+        # ===== lambda_0_hat on GPU =====
+        # [B,L,L]
+        diff = e_bar[:, :, None] - e_0[:, None, :]
+        kernel = torch.exp(-diff**2 / bandwidth_square)
+        lambda0_hat = kernel.mean(dim=2)    # [B,L]
 
-        def lambda_0_hat_kmeans(e_query, e_ref):
-            n_c = min(n_clusters, len(e_ref))
-            kmeans = KMeans(n_clusters=n_c, n_init="auto", random_state=0)
-            kmeans.fit(e_ref.reshape(-1, 1))
+        # ===== omega =====
+        omega = (lambda_1 ** (r_k - r_k1)) * (lambda0_hat ** (r_k1 - r_k))   # [B,L]
 
-            centroids = kmeans.cluster_centers_.reshape(-1)
-            counts = np.bincount(kmeans.labels_)
+        # ===== thinning =====
+        keep = torch.rand_like(omega) < omega
+        e_thin = torch.where(keep, e_bar, torch.zeros_like(e_bar))
 
-            diff = e_query.reshape(-1, 1) - centroids.reshape(1, -1)
-            kernel = np.exp(-(diff ** 2) / bandwidth_square)
+        # ===== upper bound =====
+        upper = 2 * ((lambda_1 ** (k * gap)) * (omega ** (1 - k * gap))).amax(dim=1) + 2
 
-            return (kernel @ counts) / len(e_ref)
+        # ===== add =====
+        n_add = torch.poisson(upper * T)      # [B]
 
-        batch_results = []
+        all_new = []
+        all_mask = []
 
         for b in range(B):
-            e0_b = e_0[b]
-            ebar_b = e_bar[b]
+            Nb = int(n_add[b].item())
+            if Nb > 0:
+                e_candidate = torch.rand(Nb, device=device) * T
+                diff = e_candidate[:, None] - e_0[b][None, :]
+                kernel = torch.exp(-diff**2 / bandwidth_square)
+                lambda0_add = kernel.mean(dim=1)
 
-            # thin
-            lambda0_hat = lambda_0_hat_kmeans(ebar_b, e0_b)
+                omega_add = (lambda_1 ** (r_k - r_k1)) * (lambda0_add ** (r_k1 - r_k))
+                lambda_bar = (lambda_1 ** r_k1) * (lambda0_add ** (1 - r_k1))
 
-            omega_bar = (
-                (lambda_1 ** (r_k - r_k1)) *
-                (lambda0_hat ** (r_k1 - r_k))
-            )
-
-            keep_mask = np.random.rand(ebar_b.shape[0]) < omega_bar
-            e_thin = np.where(keep_mask, ebar_b, 0.0)
-
-            # add
-            upper_b = (
-                2 * np.max(
-                    (lambda_1 ** (k * gap)) *
-                    (omega_bar ** (1 - k * gap))
-                ) + 2
-            )
-
-            n_add = np.random.poisson(upper_b * T)
-            if n_add > 0:
-                e_candidate = np.random.rand(n_add) * T
-
-                lambda0_hat_add = lambda_0_hat_kmeans(e_candidate, e0_b)
-
-                omega_add = (
-                    (lambda_1 ** (r_k - r_k1)) *
-                    (lambda0_hat_add ** (r_k1 - r_k))
-                )
-
-                lambda_bar_add = (
-                    (lambda_1 ** r_k1) *
-                    (lambda0_hat_add ** (1 - r_k1))
-                )
-
-                # accept = np.random.rand(n_add) < ((omega_add - 1) * lambda_bar_add)
-                p = (omega_add - 1) * lambda_bar_add / upper_b
-                accept = np.random.rand(n_add) < np.clip(p, 0, 1)
+                p = (omega_add - 1) * lambda_bar / upper[b]
+                accept = torch.rand_like(p) < torch.clamp(p, 0, 1)
                 e_add = e_candidate[accept]
             else:
-                e_add = np.array([])
+                e_add = torch.empty(0, device=device)
 
-            merged = np.sort(np.concatenate([e_thin[e_thin > 0], e_add]))
-            batch_results.append(merged)
+            merged = torch.sort(torch.cat([e_thin[b][e_thin[b] > 0], e_add]))[0]
+            all_new.append(merged)
 
-        # ===== Pad to max length across batch =====
-        lengths = np.array([len(x) for x in batch_results], dtype=np.int64)
-        max_len = max(len(x) for x in batch_results)
+        # pad
+        max_len = max(len(x) for x in all_new)
+        time = torch.zeros(B, max_len, device=device)
+        mask = torch.zeros(B, max_len, dtype=torch.bool, device=device)
 
-        e_r = np.zeros((B, max_len), dtype=np.float32)
-        event_mask = np.zeros((B, max_len), dtype=bool)
-        for b, seq in enumerate(batch_results):
-            e_r[b, :len(seq)] = seq
-            event_mask[b, :len(seq)] = True
+        for b, seq in enumerate(all_new):
+            time[b, :len(seq)] = seq
+            mask[b, :len(seq)] = True
 
-        sequence_length = torch.from_numpy(lengths)
+        tau = self.build_tau(time, mask, T)
 
-        mask = torch.from_numpy(event_mask).to(device)
-        time = torch.from_numpy(e_r).to(device)
-        tmax = T if torch.is_tensor(T) else torch.tensor(T).to(device)
-        tau = self.build_tau(time, mask, tmax).to(device)
+        return Batch(time=time, mask=mask, tau=tau, tmax=T,
+                    unpadded_length=mask.sum(1), kept=None)
 
-        return Batch(
-            time=time,
-            mask=mask,
-            tau=tau,
-            tmax=tmax,
-            unpadded_length=sequence_length.to(device),
-            kept=None, 
-        )
     
-
     def approximate_lambda_0_hat(self, lambda_1, e_rk_array):
         """
         e_rk_array: [steps, batch, value]
@@ -1031,7 +971,7 @@ class AddThin(DiffusionModell):
         lambda_0_hat = self.approximate_lambda_0_hat(self.lambda_1, torch.tensor(result_rk_array))
         # self.lambda_0_hat = lambda_0_hat
         
-        return torch.tensor(result_rk_array), self.lambda_1, self.k_steps, torch.tensor(sample_result_rk_array)
+        return torch.tensor(result_rk_array).to(device), self.lambda_1, self.k_steps, torch.tensor(sample_result_rk_array).to(device), x_0.tmax
 
     def build_batch_from_events(self, event_lists, tmax, device):
         """
@@ -1159,7 +1099,7 @@ class AddThin(DiffusionModell):
              # 3. Using omega value to scale sample the x_0 value
             x_n_1 = self.backward_sample(x_n, lambda_1_batch, omega_list)
             x_n = x_n_1
-            omega_batch = torch.as_tensor(
+            omega_batch = torch.stack(
                 omega_list,
                 device=lambda_1_batch.device,
                 dtype=lambda_1_batch.dtype,
