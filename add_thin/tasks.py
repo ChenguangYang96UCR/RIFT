@@ -80,7 +80,6 @@ class Tasks(pl.LightningModule):
         """
         # Forward pass
         result_array, lambda_1, steps, sample_array = self.model.forward(batch)
-        print(f"result_array length: {len(result_array)}")
 
         l11_loss = self.L11_loss(result_array, lambda_1, steps, sample_array)
         mse_losses = [self.mse_loss(result_array[i], result_array[i + 1])
@@ -118,9 +117,6 @@ class Tasks(pl.LightningModule):
             batch_size=batch.batch_size,
         )
 
-        print(f"l11 loss shape {l11_loss.shape} value {l11_loss.item()}, "
-          f"mse loss shape {mse_loss.shape} value {mse_loss.item()}, "
-          f"minus shape {final_loss.shape} value {final_loss.item()}")
         return final_loss
 
     def configure_optimizers(self):

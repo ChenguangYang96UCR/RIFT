@@ -216,12 +216,7 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         num_patches = H // self.patch_size
-        
-        print(f"patch size {self.patch_size}, num_patches: {num_patches}, hidden size: {self.hidden_size}")
-        
         x = self.proj(x)  # (B, hidden_size, P, P)
-        print(f"rearrange x size : {x.shape}")
-        
         x = rearrange(x, 'b c h w -> b (h w) c', h=num_patches, w=num_patches)
         return x
 
@@ -282,7 +277,6 @@ class DiTBlock(nn.Module):
         # if x.dim() == 2:
         #     print(f'x need to unsqueeze')
         #     x = x.unsqueeze(1)
-        print(f"DiTBlock: x shape is {x.shape}")
         # Calculate adaLN modulation parameters
         adaLN_out = self.adaLN_modulation(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaLN_out.chunk(6, dim=1)
@@ -290,9 +284,7 @@ class DiTBlock(nn.Module):
         # Attention block
         x_norm = self.norm1(x)
         x_modulated = modulate(x_norm, shift_msa, scale_msa)
-        
-        print(f"DiTBlock: x modulated shape is : {x_modulated.shape}")
-        print(f"DiTBlock: c shape is : {c.shape}")
+
         B, N, C = x_modulated.shape
         qkv = self.qkv(x_modulated).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -341,27 +333,17 @@ class FinalLayer(nn.Module):
         nn.init.constant_(self.linear.bias, 0)
 
     def forward(self, x, c):
-        print(f"##1. Final Layer: input x shape {x.shape}, c shape {c.shape}")
         
         adaLN_out = self.adaLN_modulation(c)
         shift, scale = adaLN_out.chunk(2, dim=1)
-        print(f"##2. Final Layer: input shift shape {shift.shape}, scale shape {scale.shape}")
-        
         x = self.norm_final(x)
-        print(f"##3. Final Layer: after layer norm x shape {x.shape}")
-        
         x = modulate(x, shift, scale)
-        print(f"##4. Final Layer: after modulate x shape {x.shape}")
-        
         x = self.linear(x)
-        print(f"##5. Final Layer: dense parameter: #1 {self.patch_size * self.patch_size * self.out_channels}, self.patch_size {self.patch_size}, self.out_channels {self.out_channels}")
-        print(f"##6. Final Layer: after linear dense x shape {x.shape}")
         return x
 
 class MLP(nn.Module):
     def __init__(self, L, out_dim, hidden=None, dropout=0.0):
         super().__init__()
-        print(f"MLP L number is {L}")
         if hidden is None:
             # just one linear projection
             self.mlp = nn.Linear(L, out_dim)
@@ -385,7 +367,6 @@ class MLP(nn.Module):
 class DiT_MLP(nn.Module):
     def __init__(self, L, out_dim, hidden=None, dropout=0.0):
         super().__init__()
-        print(f"MLP L number is {L}")
         if hidden is None:
             # just one linear projection
             self.mlp = nn.Linear(L, out_dim)
@@ -648,7 +629,7 @@ class AddThin(DiffusionModell):
         self.history = embedding.gather(1, gather_index).squeeze(-2)
 
     def compute_emb(
-        self, n: TensorType[torch.long, "batch"], x_n: Tuple
+        self, n: TensorType[torch.long, "batch"], x_n: Batch
     ) -> Tuple[
         TensorType["batch", "embedding"],
         TensorType["batch", "sequence", "embedding"],
@@ -661,8 +642,8 @@ class AddThin(DiffusionModell):
         ----------
         n : TensorType[torch.long, "batch"]
             Diffusion time step
-        x_n : Tuple
-              [e_rk, sequence_length, mask, x_0 tau]
+        x_n : Batch
+            Batch of data
 
         Returns
         -------
@@ -673,8 +654,8 @@ class AddThin(DiffusionModell):
         ]
             Diffusion time embedding, event time embedding, event sequence embedding
         """
-        B, L = x_n[0].shape[0], x_n[0].shape[1]
-        print(f"L value: {L}")
+        device = x_n.time.device
+        B, L = x_n.batch_size, x_n.seq_len
 
         # embed diffusion and process time
         dif_time_emb = self.diffusion_time_encoder(n)
@@ -686,14 +667,13 @@ class AddThin(DiffusionModell):
             )
 
         # Embed event and interevent time
-        # TODO: think how to get the interevent tau value
         time_emb = self.time_encoder(
-            torch.cat([x_n[0].unsqueeze(-1), x_n[2].unsqueeze(-1)], dim=-1)
+            torch.cat([x_n.time.to(device).unsqueeze(-1), x_n.tau.to(device).unsqueeze(-1)], dim=-1)
         ).reshape(B, L, -1)
 
         # Embed event sequence and mask out
         event_emb = self.sequence_encoder(time_emb)
-        event_emb = event_emb * x_n[2][..., None]
+        event_emb = event_emb * x_n.mask[..., None]
 
         return (
             dif_time_emb,
@@ -732,36 +712,6 @@ class AddThin(DiffusionModell):
             dtype=torch.long,
         )
 
-    def noise(
-        self, x_0: Batch, n: TensorType[torch.long, "batch"]
-    ) -> Tuple[Batch, Batch]:
-        """
-        Sample x_n from x_0 by applying the noising process.
-
-        Parameters
-        ----------
-        x_0 : Batch
-            Batch of data
-        n : TensorType[torch.long, "batch"]
-            Number of noise steps
-
-        Returns
-        -------
-        Tuple[Batch, Batch]
-            x_n and thinned x_0
-        """
-        # Thin x_0
-        x_0_kept, x_0_thinned = x_0.thin(alpha=self.alpha_cumprod[n])
-
-        # Superposition with HPP (add)
-        hpp = generate_hpp(
-            tmax=x_0.tmax,
-            n_sequences=len(x_0),
-            intensity=1 - self.alpha_cumprod[n],
-        )
-        x_n = x_0_kept.add_events(hpp)
-
-        return x_n, x_0_thinned
 
     def DiT(self, x, t, dt, train=False, return_activations=False):
         activations = {}
@@ -780,15 +730,10 @@ class AddThin(DiffusionModell):
         
         # Get timestep embeddings
         # TODO exchange shape from (sequence, embeding) to (sequence, )
-        print(f"DiT: before embed x shape is {x.shape}")
         e = x.mean(dim=-1)          # (sequence,)
         x = self.event_embed(e)  # (B, hidden_size)
-        print(f"DiT: after embed x shape is {x.shape}")
-        print(f"DiT: before embed t shape is {t.shape}")
         t_mean = t.mean(dim=-1)
         te = self.time_embed(t_mean)  # (B, hidden_size)
-        print(f"DiT: after embed t shape is {t.shape}")
-        print(f"DiT: before embed dtt shape is {dt.shape}")
         dt_mean = dt.mean(dim=-1)
         dte = self.dt_embed(dt_mean)  # (B, hidden_size)
         c = te + dte
@@ -797,8 +742,6 @@ class AddThin(DiffusionModell):
         activations['time_embed'] = te
         activations['dt_embed'] = dte
         activations['conditioning'] = c
-
-        print("DiT: Conditioning of shape", c.shape, "dtype", c.dtype)
         
         # Apply DiT blocks
         for i in range(2):
@@ -809,11 +752,8 @@ class AddThin(DiffusionModell):
         x = self.final_layer(x, c)  # (B, num_patches, p*p*c)
         activations['final_layer'] = x
         
-
         # Flatten for MLP processing
-        print(f"Before DiT MLP shape {x.shape}")
         x_flat = x.reshape(x.shape[0], -1)
-        print(f"After DiT MLP shape {x_flat.shape}")
         
         # Apply final MLP
         mlp = DiT_MLP(x_flat.shape[1], data_length, 1).to(device)
@@ -823,23 +763,34 @@ class AddThin(DiffusionModell):
             mlp.eval()
         
         e_new = mlp(x_flat)
-
-        print(f"DiT: e_new shape is {e_new.shape}")
-
-        scalar = e_new.mean(dim=1).mean()
-
-        print(f"DiT: scalar shape is {scalar.shape}")
-        
+        scalar = e_new.mean(dim=1).mean()        
         return scalar
 
     def lambda_0_hat(e_bar, e_0, bandwidth_square):
-            print(f"before kernel values, e_bar {e_bar.reshape(-1, 1).shape}, e_0 {e_0.reshape(1, -1).shape}")
             kernel_values = np.exp(-((e_bar.reshape((-1, 1)) - e_0.reshape((1, -1))) **2 ) / (bandwidth_square))
             return np.sum(kernel_values, axis = 1) / len(e_0)
 
     def random_sample_by_interval(self, max_val=1, interval=0.01):
         samples = np.arange(0, max_val + interval, interval)
         return samples
+
+    def build_tau(self, time, mask, tmax):
+        # time, mask: torch tensors [B, L]
+        # tmax: [B] or scalar
+
+        # 用 tmax 填充 padding
+        time_tau = torch.where(mask, time, tmax[:, None] if tmax.ndim == 1 else tmax)
+
+        # diff along sequence
+        tau = torch.diff(
+            time_tau,
+            prepend=torch.zeros_like(time_tau[:, :1]),
+            dim=1
+        )
+
+        # mask padding
+        tau = tau * mask
+        return tau
 
     def scaled_sampling_batchwise(
         self,
@@ -863,6 +814,7 @@ class AddThin(DiffusionModell):
         """
 
         # Initialize parameter
+        device = e_0.device
         e_0 = e_0.detach().cpu().numpy()
         B, L = e_0.shape
 
@@ -927,7 +879,9 @@ class AddThin(DiffusionModell):
                     (lambda0_hat_add ** (1 - r_k1))
                 )
 
-                accept = np.random.rand(n_add) < ((omega_add - 1) * lambda_bar_add)
+                # accept = np.random.rand(n_add) < ((omega_add - 1) * lambda_bar_add)
+                p = (omega_add - 1) * lambda_bar_add / upper_b
+                accept = np.random.rand(n_add) < np.clip(p, 0, 1)
                 e_add = e_candidate[accept]
             else:
                 e_add = np.array([])
@@ -946,9 +900,20 @@ class AddThin(DiffusionModell):
             event_mask[b, :len(seq)] = True
 
         sequence_length = torch.from_numpy(lengths)
-        event_mask = torch.from_numpy(event_mask)
 
-        return torch.from_numpy(e_r), sequence_length, event_mask
+        mask = torch.from_numpy(event_mask).to(device)
+        time = torch.from_numpy(e_r).to(device)
+        tmax = T if torch.is_tensor(T) else torch.tensor(T).to(device)
+        tau = self.build_tau(time, mask, tmax).to(device)
+
+        return Batch(
+            time=time,
+            mask=mask,
+            tau=tau,
+            tmax=tmax,
+            unpadded_length=sequence_length.to(device),
+            kept=None, 
+        )
     
 
     def approximate_lambda_0_hat(self, lambda_1, e_rk_array):
@@ -988,9 +953,6 @@ class AddThin(DiffusionModell):
             classification logits, log likelihood of x_0 without x_n, noised data
         """
         # Uniformly sample n
-        print(f"x_0 is {x_0}")
-        print(f"x_0 time shape is {x_0.time.shape}")
-        print(f"x_0 mask shape is {x_0.mask.shape}")
         device = x_0.time.device
         n = self.get_n(
             min=0,
@@ -1004,28 +966,24 @@ class AddThin(DiffusionModell):
         M = 100
         r_k1 = r_k - (1/self.k_steps)
         
-        e_rk1 = x_0.time * x_0.mask
+        time_rk1 = x_0.time * x_0.mask
         e_new = []
         time = []
-        e_0 = x_0.time * x_0.mask
-        batch_size = e_0.shape[0]
+        time_0 = x_0.time * x_0.mask
+        batch_size = time_0.shape[0]
 
         # noise the event
         for i in range(1, self.k_steps): 
-            e_rk, sequence_length, mask = self.scaled_sampling_batchwise(i, self.lambda_1, e_0, e_rk1, x_0.tmax, r_k, r_k1)
-            e_rk1 = e_rk
+            bew_batch = self.scaled_sampling_batchwise(i, self.lambda_1, time_0, time_rk1, x_0.tmax, r_k, r_k1)
+            time_0 = time_rk1
+            time_rk1 = bew_batch.time * bew_batch.mask
             # e_new.append(e_rk)
-            print(f"e_rk shape is {e_rk.shape}")
 
             # Generate event embeding 
-            (dif_time_emb, time_emb, event_emb) = self.compute_emb(n=n, x_n=(e_rk.to(device), sequence_length.to(device), mask.to(device), x_0.tau.to(device)))
+            # TODO update tau
+            (dif_time_emb, time_emb, event_emb) = self.compute_emb(n=n, x_n=bew_batch)
             e_new.append(event_emb)
-            print(f"event_emb shape is {event_emb.shape}")
             time.append(time_emb)
-            print(f"time_emb shape is {time_emb.shape}")
-
-        print(f"e_new data length: {len(e_new)}")
-        print(f"time data length : {len(time)}")
 
         result_rk_array = []
 
@@ -1037,14 +995,12 @@ class AddThin(DiffusionModell):
 
                 # Generate random timesteps using PyTorch instead of JAX
                 # t = torch.rand(self.hidden_size, device=e.device)
-                # TODO step mlp
                 # dt = torch.rand(time[index][batch_index].shape[0], time[index][batch_index].shape[1], device=batch_e.device)
                 dt = get_timestep_embedding(
                     torch.tensor([index], device=device),
                     self.hidden_size
                 )
                 result = self.DiT(batch_e, time[index][batch_index], dt)
-                print(f" DiT result shape: ", result.shape)  
                 batrch_result_array.append(result)
             result_rk_array.append(batrch_result_array)
 
@@ -1061,165 +1017,297 @@ class AddThin(DiffusionModell):
                 time_smaple = self.random_sample_by_interval(max_val=1)
                 time_embeding = get_timestep_embedding(torch.from_numpy(time_smaple), self.hidden_size)
 
-                # TODO step mlp
                 # dt = torch.rand(time[index][batch_index].shape[0], time_embeding, device=batch_e.device)
                 dt = get_timestep_embedding(
                     torch.tensor([index], device=device),
                     self.hidden_size
                 )
                 result = self.DiT(batch_e, time_embeding.to(device), dt)
-                print(f" DiT result shape: ", result.shape)  
                 batrch_result_array.append(result)
             sample_result_rk_array.append(batrch_result_array)
 
         # calculate approximate lambda_0 hat
-        print(f"e_rk_array length is {len(result_rk_array)}, each element length is {len(result_rk_array[0])}")
         # print(f"forward e_rk array length {len(e_rk_array)}, stack array length {torch.stack(e_rk_array).shape}")
         lambda_0_hat = self.approximate_lambda_0_hat(self.lambda_1, torch.tensor(result_rk_array))
         # self.lambda_0_hat = lambda_0_hat
-        print(f"lambda_0_hat value is {lambda_0_hat}")
         
-        # TODO sample time and re-run DiT
         return torch.tensor(result_rk_array), self.lambda_1, self.k_steps, torch.tensor(sample_result_rk_array)
 
-    def sample(self, n_samples: int, tmax) -> Batch:
+    def build_batch_from_events(self, event_lists, tmax, device):
         """
-        Sample x_0 from ADD-THIN starting from x_N.
-
-        Parameters
-        ----------
-        n_samples : int
-            Number of samples
-        tmax : float
-            T of the temporal point process
-        begin_forecast : None, optional
-            Beginning of the forecast, by default None
-        end_forecast : None, optional
-            End of the forecast, by default None
-
-        Returns
-        -------
-        Batch
-            Sampled x_0s
+        event_lists: List[np.ndarray], length = B
+        each array shape = [L_b]
         """
-        # Init x_N by sampling from HPP
-        x_N = generate_hpp(tmax=tmax, n_sequences=n_samples)
-        # print('x-n size: ')
-        # print(x_N.time.size())
-        x_n_1 = x_N
 
-        # Sample x_N-1, ..., x_1 by applying posterior
-        for n_int in range(self.steps - 1, 0, -1):
-            n = torch.full(
-                (n_samples,), n_int, device=tmax.device, dtype=torch.long
-            )
-            x_n_1 = self.sample_posterior(x_n=x_n_1, n=n)
+        B = len(event_lists)
+        lengths = torch.tensor([len(x) for x in event_lists], device=device)
+        max_len = lengths.max().item()
 
-        # Sample x_0
-        n = torch.full(
-            (n_samples,), n_int - 1, device=tmax.device, dtype=torch.long
+        # ---- time & mask ----
+        time = torch.zeros((B, max_len), device=device)
+        mask = torch.zeros((B, max_len), dtype=torch.bool, device=device)
+
+        for b, ev in enumerate(event_lists):
+            if len(ev) > 0:
+                time[b, :len(ev)] = torch.tensor(ev, device=device)
+                mask[b, :len(ev)] = True
+
+        # ---- tau ----
+        # padding 用 tmax 填
+        if not torch.is_tensor(tmax):
+            tmax = torch.tensor(tmax, device=device)
+        else:
+            tmax = tmax.to(device)
+
+        time_tau = torch.where(mask, time, tmax)
+        tau = torch.diff(
+            time_tau,
+            prepend=torch.zeros((B, 1), device=device),
+            dim=1
         )
-        x_0, x_classifed, sampled_x_0, classified_not_x_0 = self.sample_x_0(n=n, x_n=x_n_1)
+        tau = tau * mask
 
-        alpha_n = self.get_n(
+        return time, mask, tau, lengths
+
+
+    def backward_sample(self, x_n, lambda_rk, omega_t):
+
+        def backward_sample_single(time_b, lambda_rk_b, omega_b, tmax):
+            kept = []
+            for t in time_b:
+                if t <= 0:
+                    continue
+                if np.random.rand() < min(omega_b, 1.0):
+                    kept.append(t)
+
+            # build upper bound
+            ts = np.linspace(0, tmax, 1000)
+            lambda_plus = np.maximum(omega_b - 1, 0) * lambda_rk_b
+            M = lambda_plus
+
+            N = np.random.poisson(M * tmax)
+
+            u = np.random.uniform(0, tmax, size=N)
+            v = np.random.uniform(0, M, size=N)
+
+            added = []
+            for ti, vi in zip(u, v):
+                if vi < max(omega_b - 1, 0) * lambda_rk_b:
+                    added.append(ti)
+
+            return np.sort(np.concatenate([kept, added]))
+        
+        B = x_n.time.shape[0]
+        event_lists = []
+        for b in range(B):
+            e_new_b = backward_sample_single(
+                x_n.time[b].cpu().numpy(),
+                float(lambda_rk[b]),
+                float(omega_t[b]),
+                float(x_n.tmax[b] if x_n.tmax.ndim > 0 else x_n.tmax),
+            )
+            event_lists.append(e_new_b)
+
+        time, mask, tau, lengths = self.build_batch_from_events(
+            event_lists,
+            tmax=x_n.tmax,
+            device=x_n.time.device
+        )
+
+        return Batch(
+                    time=time,
+                    mask=mask,
+                    tau=tau,
+                    tmax=x_n.tmax,
+                    unpadded_length=lengths,
+                    kept=None,
+                )
+
+    def sample(self, n_samples: int, tmax) -> Batch:
+        
+        # 1. Generate the x_n event list
+        x_n = generate_hpp(tmax=tmax, n_sequences=n_samples)
+        B = x_n.time.shape[0]
+        device = x_n.time.device
+        batch_size = x_n.time.shape[0]
+        n = self.get_n(
             min=0,
             max=self.steps,
-            shape=(len(x_0),),
-            device=x_0.time.device,
+            shape=(len(x_n.time),),
+            device=device,
         )
-        x_0_kept, x_0_thinned = x_0.thin(alpha=self.alpha_cumprod[alpha_n])
-        x_n = x_0_kept.add_events(x_N)
-        self.temp_x_N = x_n
 
+        (dif_time_emb, time_emb, event_emb) = self.compute_emb(n=n, x_n=x_n)
+
+        lambda_1_batch = torch.full(
+            (B,),
+            float(self.lambda_1),
+            device=device,
+        )
+        for step in range(self.k_steps - 1, 0, -1):
+            # 2. Get the omega value from DiT process
+            omega_list = []
+            for batch_index in range(batch_size):
+                batch_e = event_emb[batch_index].to(torch.float32).to(device)
+                dt = get_timestep_embedding(
+                        torch.tensor([step], device=device),
+                        self.hidden_size
+                    )
+                omega_k_minus_1 = self.DiT(batch_e, time_emb[batch_index].to(device), dt)
+                omega_list.append(omega_k_minus_1)
+
+             # 3. Using omega value to scale sample the x_0 value
+            x_n_1 = self.backward_sample(x_n, lambda_1_batch, omega_list)
+            x_n = x_n_1
+            omega_batch = torch.as_tensor(
+                omega_list,
+                device=lambda_1_batch.device,
+                dtype=lambda_1_batch.dtype,
+            )
+            lambda_1_batch = lambda_1_batch * omega_batch
+
+        x_0 = x_n
         return x_0
 
-    def sample_x_0(
-        self, n: TensorType[int], x_n: Batch
-    ) -> Tuple[Batch, Batch, Batch, Batch]:
-        """
-        Sample x_0 from x_n by classifying the intersection of x_0 and x_n and sampling from the intensity.
 
-        Parameters
-        ----------
-        n : TensorType[int]
-            Diffusion time steps
-        x_n : Batch
-            Batch of data
+    # def sample(self, n_samples: int, tmax) -> Batch:
+    #     """
+    #     Sample x_0 from ADD-THIN starting from x_N.
 
-        Returns
-        -------
-        Tuple[Batch, Batch, Batch, Batch]
-            x_0, classified_x_0, sampled_x_0, classified_not_x_0
-        """
-        (
-            dif_time_emb,
-            time_emb,
-            event_emb,
-        ) = self.compute_emb(n=n, x_n=x_n)
+    #     Parameters
+    #     ----------
+    #     n_samples : int
+    #         Number of samples
+    #     tmax : float
+    #         T of the temporal point process
+    #     begin_forecast : None, optional
+    #         Beginning of the forecast, by default None
+    #     end_forecast : None, optional
+    #         End of the forecast, by default None
 
-        # Sample x_0\x_n from intensity
-        sampled_x_0 = self.intensity_model.sample(
-            event_emb=event_emb,
-            dif_time_emb=dif_time_emb,
-            n_samples=1,
-            x_n=x_n,
-        )
+    #     Returns
+    #     -------
+    #     Batch
+    #         Sampled x_0s
+    #     """
+    #     # Init x_N by sampling from HPP
+    #     x_N = generate_hpp(tmax=tmax, n_sequences=n_samples)
+    #     # print('x-n size: ')
+    #     # print(x_N.time.size())
+    #     x_n_1 = x_N
 
-        # Classify (x_0 ∩ x_n) from x_n
-        x_n_and_x_0_logits = self.classifier_model(
-            dif_time_emb=dif_time_emb, time_emb=time_emb, event_emb=event_emb
-        )
-        classified_x_0, classified_not_x_0 = x_n.thin(
-            alpha=x_n_and_x_0_logits.sigmoid()
-        )
-        return (
-            classified_x_0.add_events(sampled_x_0),
-            classified_x_0,
-            sampled_x_0,
-            classified_not_x_0,
-        )
+    #     # Sample x_N-1, ..., x_1 by applying posterior
+    #     for n_int in range(self.steps - 1, 0, -1):
+    #         n = torch.full(
+    #             (n_samples,), n_int, device=tmax.device, dtype=torch.long
+    #         )
+    #         x_n_1 = self.sample_posterior(x_n=x_n_1, n=n)
 
-    def sample_posterior(self, x_n: Batch, n: TensorType[int]) -> Batch:
-        """
-        Sample x_n-1 from x_n by predicting x_0 and then sampling from the posterior.
+    #     # Sample x_0
+    #     n = torch.full(
+    #         (n_samples,), n_int - 1, device=tmax.device, dtype=torch.long
+    #     )
+    #     x_0, x_classifed, sampled_x_0, classified_not_x_0 = self.sample_x_0(n=n, x_n=x_n_1)
 
-        Parameters
-        ----------
-        x_n : Batch
-            Batch of data
-        n : TensorType
-            Diffusion time steps
+    #     alpha_n = self.get_n(
+    #         min=0,
+    #         max=self.steps,
+    #         shape=(len(x_0),),
+    #         device=x_0.time.device,
+    #     )
+    #     x_0_kept, x_0_thinned = x_0.thin(alpha=self.alpha_cumprod[alpha_n])
+    #     x_n = x_0_kept.add_events(x_N)
+    #     self.temp_x_N = x_n
 
-        Returns
-        -------
-        Batch
-            x_n-1
-        """
-        # Sample x_0 and x_n\x_0
-        _, classified_x_0, sampled_x_0, classified_not_x_0 = self.sample_x_0(
-            n=n, x_n=x_n
-        )
+    #     return x_0
 
-        # Sample C
-        x_0_kept, _ = sampled_x_0.thin(alpha=self.alpha_x0_kept[n - 1])
+    # def sample_x_0(
+    #     self, n: TensorType[int], x_n: Batch
+    # ) -> Tuple[Batch, Batch, Batch, Batch]:
+    #     """
+    #     Sample x_0 from x_n by classifying the intersection of x_0 and x_n and sampling from the intensity.
 
-        # Sample D
-        hpp = generate_hpp(
-            tmax=x_n.tmax,
-            n_sequences=x_n.batch_size,
-            intensity=self.add_remove[n - 1],
-        )
+    #     Parameters
+    #     ----------
+    #     n : TensorType[int]
+    #         Diffusion time steps
+    #     x_n : Batch
+    #         Batch of data
 
-        # Sample E
-        x_n_kept, _ = classified_not_x_0.thin(alpha=self.alpha_xn_kept[n - 1])
+    #     Returns
+    #     -------
+    #     Tuple[Batch, Batch, Batch, Batch]
+    #         x_0, classified_x_0, sampled_x_0, classified_not_x_0
+    #     """
+    #     (
+    #         dif_time_emb,
+    #         time_emb,
+    #         event_emb,
+    #     ) = self.compute_emb(n=n, x_n=x_n)
 
-        # Superposition of B, C, D, E to attain x_n-1
-        x_n_1 = (
-            classified_x_0.add_events(hpp)
-            .add_events(x_n_kept)
-            .add_events(x_0_kept)
-        )
-        return x_n_1
+    #     # Sample x_0\x_n from intensity
+    #     sampled_x_0 = self.intensity_model.sample(
+    #         event_emb=event_emb,
+    #         dif_time_emb=dif_time_emb,
+    #         n_samples=1,
+    #         x_n=x_n,
+    #     )
+
+    #     # Classify (x_0 ∩ x_n) from x_n
+    #     x_n_and_x_0_logits = self.classifier_model(
+    #         dif_time_emb=dif_time_emb, time_emb=time_emb, event_emb=event_emb
+    #     )
+    #     classified_x_0, classified_not_x_0 = x_n.thin(
+    #         alpha=x_n_and_x_0_logits.sigmoid()
+    #     )
+    #     return (
+    #         classified_x_0.add_events(sampled_x_0),
+    #         classified_x_0,
+    #         sampled_x_0,
+    #         classified_not_x_0,
+    #     )
+
+    # def sample_posterior(self, x_n: Batch, n: TensorType[int]) -> Batch:
+    #     """
+    #     Sample x_n-1 from x_n by predicting x_0 and then sampling from the posterior.
+
+    #     Parameters
+    #     ----------
+    #     x_n : Batch
+    #         Batch of data
+    #     n : TensorType
+    #         Diffusion time steps
+
+    #     Returns
+    #     -------
+    #     Batch
+    #         x_n-1
+    #     """
+    #     # Sample x_0 and x_n\x_0
+    #     _, classified_x_0, sampled_x_0, classified_not_x_0 = self.sample_x_0(
+    #         n=n, x_n=x_n
+    #     )
+
+    #     # Sample C
+    #     x_0_kept, _ = sampled_x_0.thin(alpha=self.alpha_x0_kept[n - 1])
+
+    #     # Sample D
+    #     hpp = generate_hpp(
+    #         tmax=x_n.tmax,
+    #         n_sequences=x_n.batch_size,
+    #         intensity=self.add_remove[n - 1],
+    #     )
+
+    #     # Sample E
+    #     x_n_kept, _ = classified_not_x_0.thin(alpha=self.alpha_xn_kept[n - 1])
+
+    #     # Superposition of B, C, D, E to attain x_n-1
+    #     x_n_1 = (
+    #         classified_x_0.add_events(hpp)
+    #         .add_events(x_n_kept)
+    #         .add_events(x_0_kept)
+    #     )
+    #     return x_n_1
     
 
     # ! When use this function, make sure have already use model function create a temporary x_N
