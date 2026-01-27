@@ -1099,11 +1099,7 @@ class AddThin(DiffusionModell):
              # 3. Using omega value to scale sample the x_0 value
             x_n_1 = self.backward_sample(x_n, lambda_1_batch, omega_list)
             x_n = x_n_1
-            omega_batch = torch.stack(
-                omega_list,
-                device=lambda_1_batch.device,
-                dtype=lambda_1_batch.dtype,
-            )
+            omega_batch = torch.stack(omega_list).to(lambda_1_batch.device)
             lambda_1_batch = lambda_1_batch * omega_batch
 
         x_0 = x_n
