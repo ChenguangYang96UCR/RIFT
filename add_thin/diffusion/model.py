@@ -971,7 +971,7 @@ class AddThin(DiffusionModell):
         lambda_0_hat = self.approximate_lambda_0_hat(self.lambda_1, torch.tensor(result_rk_array))
         # self.lambda_0_hat = lambda_0_hat
         
-        return torch.tensor(result_rk_array).to(device), self.lambda_1, self.k_steps, torch.tensor(sample_result_rk_array).to(device), x_0.tmax
+        return torch.stack([torch.stack(x) for x in result_rk_array]).to(device), self.lambda_1, self.k_steps, torch.tensor(sample_result_rk_array).to(device), x_0.tmax
 
     def build_batch_from_events(self, event_lists, tmax, device):
         """
