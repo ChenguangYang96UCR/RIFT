@@ -335,7 +335,17 @@ class Batch:
         time, mask, kept = Batch.sort_time(time, mask, kept, tmax=tmax)
 
         # Reduce padding along sequence length
-        max_length = max(mask.sum(-1)).int()
+        if mask.shape[0] == 0:
+            return Batch(
+                mask=torch.zeros((0, 0), dtype=torch.bool, device=time.device),
+                time=torch.zeros((0, 0), dtype=time.dtype, device=time.device),
+                tau=torch.zeros((0, 0), dtype=time.dtype, device=time.device),
+                tmax=tmax,
+                unpadded_length=torch.zeros((0,), dtype=torch.long, device=time.device),
+                kept=None if kept is None else torch.zeros((0, 0), dtype=kept.dtype, device=kept.device),
+            )
+
+        max_length = mask.sum(-1).max().int()
         mask = mask[:, : max_length + 1]
         time = time[:, : max_length + 1]
         if kept is not None:
@@ -409,41 +419,29 @@ class Batch:
         t_min: TensorType[float],
         t_max: TensorType[float],
     ) -> Tuple["Batch", "Batch", TensorType, TensorType]:
-        """
-        Split events according to time.
-
-        Parameters:
-        ----------
-        t_min : TensorType[float]
-            Minimum time of events to keep.
-        t_max : TensorType[float]
-            Maximum time of events to keep.
-
-        Returns:
-        -------
-        history : Batch
-            Batch of events before t_min.
-        forecast : Batch
-            Batch of events between t_min and t_max.
-        t_max : TensorType
-            Maximum time of events to keep.
-        t_min : TensorType
-            Minimum time of events to keep.
-        """
         assert t_min.dim() == 1, "time has too many dimensions"
         assert t_max.dim() == 1, "time has too many dimensions"
 
         history_mask = self.time < t_min[:, None]
         forecast_mask = (self.time < t_max[:, None]) & ~history_mask
 
-        # remove from mask
         forecast_mask = self.mask & forecast_mask
         history_mask = self.mask & history_mask
 
-        # more than 5 events in history and more than one to be predicted
         batch_mask = (forecast_mask.sum(-1) > 1) & (history_mask.sum(-1) > 5)
 
-        # shorten padding after removal
+        if batch_mask.sum() == 0:
+            device = self.time.device
+            empty = Batch(
+                mask=torch.zeros((0, 0), dtype=torch.bool, device=device),
+                time=torch.zeros((0, 0), dtype=self.time.dtype, device=device),
+                tau=torch.zeros((0, 0), dtype=self.tau.dtype, device=device),
+                tmax=self.tmax,
+                unpadded_length=torch.zeros((0,), dtype=torch.long, device=device),
+                kept=None,
+            )
+            return empty, empty, t_max[batch_mask], t_min[batch_mask]
+
         return (
             self.remove_unnescessary_padding(
                 time=(self.time * history_mask)[batch_mask],
@@ -637,10 +635,12 @@ class DataModule(pl.LightningDataModule):
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self.val_data,
-            batch_size=len(self.val_data),  # evaluate all at once
+            batch_size=min(self.batch_size, 16),   # 或者直接设成 config 里的 val_batch_size
             collate_fn=Batch.from_sequence_list,
             num_workers=0,
+            shuffle=False,
             drop_last=False,
+            pin_memory=True,
         )
 
     def test_dataloader(self) -> DataLoader:

@@ -48,8 +48,9 @@ def xavier_uniform_init(tensor):
     return tensor
 
 class TrainConfig:
-    def __init__(self, dtype=torch.float32):
-        self.dtype = dtype
+    def __init__(self):
+        pass
+        # self.dtype = dtype
     
     def apply_init(self, module, name='default', zero=False):
         """Apply initialization to a module"""
@@ -96,7 +97,7 @@ class TimestepEmbedder(nn.Module):
         dim = self.frequency_embedding_size
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+            -math.log(max_period) * torch.arange(start=0, end=half, device=t.device) / half
         )
         args = t[:, None] * freqs[None]
         embedding = torch.cat([torch.cos(args).mean(dim=0), torch.sin(args).mean(dim=0)], dim=-1)
@@ -120,7 +121,7 @@ def get_timestep_embedding(timesteps, embedding_dim: int):
 
     # exp(range * -scale)
     emb = torch.exp(
-        torch.arange(half_dim, device=device, dtype=torch.float32) * -emb_scale
+        torch.arange(half_dim, device=device) * -emb_scale
     )
 
     # timesteps[:, None] * emb[None, :]
@@ -603,27 +604,22 @@ class AddThin(DiffusionModell):
         )
 
     def set_history(self, batch: Batch) -> None:
-        """
-        Set the history to condition the model.
-
-        Parameters
-        ----------
-        batch : Batch
-            Batch of data
-        """
         B, L = batch.time.shape
 
-        # Encode event times
+        if B == 0 or L == 0:
+            device = batch.time.device
+            emb_dim = self.history_encoder.hidden_size
+            self.history = torch.zeros((0, emb_dim), device=device, dtype=batch.time.dtype)
+            return
+
         time_emb = self.time_encoder(
             torch.cat(
                 [batch.time.unsqueeze(-1), batch.tau.unsqueeze(-1)], dim=-1
             )
         ).reshape(B, L, -1)
 
-        # Compute history embedding
         embedding = self.history_encoder(time_emb)[0]
 
-        # Index relative to time and set history
         index = (batch.mask.sum(-1).long() - 1).unsqueeze(-1).unsqueeze(-1)
         gather_index = index.repeat(1, 1, embedding.shape[-1])
         self.history = embedding.gather(1, gather_index).squeeze(-2)
@@ -722,9 +718,9 @@ class AddThin(DiffusionModell):
         
         # Convert tensors to appropriate device and dtype if needed
         if not isinstance(t, torch.Tensor):
-            t = torch.tensor(t, device=device, dtype=torch.float32)
+            t = torch.tensor(t, device=device)
         if not isinstance(dt, torch.Tensor):
-            dt = torch.tensor(dt, device=device, dtype=torch.float32)
+            dt = torch.tensor(dt, device=device)
         
         activations['patch_embed'] = x
         
@@ -756,6 +752,7 @@ class AddThin(DiffusionModell):
         x_flat = x.reshape(x.shape[0], -1)
         
         # Apply final MLP
+        # print(f"DiT_MLP shape , x_flat.shape[1]: {x_flat.shape[1]}, x_flat.shape[0]: {x_flat.shape[0]} data_length : {data_length}")
         mlp = DiT_MLP(x_flat.shape[1], data_length, 1).to(device)
         if train:
             mlp.train()
@@ -801,9 +798,17 @@ class AddThin(DiffusionModell):
 
         # ===== lambda_0_hat on GPU =====
         # [B,L,L]
-        diff = e_bar[:, :, None] - e_0[:, None, :]
-        kernel = torch.exp(-diff**2 / bandwidth_square)
-        lambda0_hat = kernel.mean(dim=2)    # [B,L]
+        def kernel_mean_chunked(e_bar, e_0, bandwidth_square, chunk_size=256):
+            B, L = e_bar.shape
+            out = torch.zeros(B, L, device=e_bar.device, dtype=e_bar.dtype)
+
+            for start in range(0, L, chunk_size):
+                end = min(start + chunk_size, L)
+                diff = e_bar[:, start:end, None] - e_0[:, None, :]   # [B, chunk, L]
+                kernel = torch.exp(-diff.pow(2) / bandwidth_square)
+                out[:, start:end] = kernel.mean(dim=2)
+            return out
+        lambda0_hat = kernel_mean_chunked(e_bar, e_0, bandwidth_square)
 
         # ===== omega =====
         omega = (lambda_1 ** (r_k - r_k1)) * (lambda0_hat ** (r_k1 - r_k))   # [B,L]
@@ -821,20 +826,34 @@ class AddThin(DiffusionModell):
         all_new = []
         all_mask = []
 
+        chunk_size = 512
         for b in range(B):
             Nb = int(n_add[b].item())
+            accepted_chunks = []
+
             if Nb > 0:
-                e_candidate = torch.rand(Nb, device=device) * T
-                diff = e_candidate[:, None] - e_0[b][None, :]
-                kernel = torch.exp(-diff**2 / bandwidth_square)
-                lambda0_add = kernel.mean(dim=1)
+                for start in range(0, Nb, chunk_size):
+                    curr_size = min(chunk_size, Nb - start)
+                    e_chunk = torch.rand(curr_size, device=device) * T   # [curr_size]
 
-                omega_add = (lambda_1 ** (r_k - r_k1)) * (lambda0_add ** (r_k1 - r_k))
-                lambda_bar = (lambda_1 ** r_k1) * (lambda0_add ** (1 - r_k1))
+                    diff = e_chunk[:, None] - e_0[b][None, :]            # [curr_size, L]
+                    kernel = torch.exp(-diff**2 / bandwidth_square)
+                    lambda0_add = kernel.mean(dim=1)                     # [curr_size]
 
-                p = (omega_add - 1) * lambda_bar / upper[b]
-                accept = torch.rand_like(p) < torch.clamp(p, 0, 1)
-                e_add = e_candidate[accept]
+                    omega_add = (lambda_1 ** (r_k - r_k1)) * (lambda0_add ** (r_k1 - r_k))
+                    lambda_bar = (lambda_1 ** r_k1) * (lambda0_add ** (1 - r_k1))
+
+                    p = (omega_add - 1) * lambda_bar / upper[b]
+                    p = torch.clamp(p, 0, 1)
+
+                    accept = torch.rand_like(p) < p
+                    accepted_chunks.append(e_chunk[accept])
+
+                e_add = (
+                    torch.cat(accepted_chunks)
+                    if len(accepted_chunks) > 0
+                    else torch.empty(0, device=device)
+                )
             else:
                 e_add = torch.empty(0, device=device)
 

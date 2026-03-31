@@ -2,7 +2,7 @@
 
 defaults:
   - data: data_set
-  - task: density # density, forecast
+  - task: forecast # density, forecast
   - hydra: default
   
   # Allow the model to overwrite the settings below
@@ -15,7 +15,7 @@ optimization:
 trainer:
   _target_: pytorch_lightning.Trainer
   accelerator: gpu
-  max_epochs: 5000
+  max_epochs: 500
   log_every_n_steps: 1
   resume_from_checkpoint: ~
   check_val_every_n_epoch: 100

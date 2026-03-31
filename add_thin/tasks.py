@@ -68,7 +68,7 @@ class Tasks(pl.LightningModule):
         inner = sample_array.mean(dim=1).squeeze(-1) / K
         exp_term = torch.exp(inner)
         term2 = (lambda_1 * T / M) * exp_term.mean()
-        return term1 - term2
+        return (term1 - term2).to(result_array.device)
 
     def mse_loss(self, e_r, e_r1):
         loss = F.mse_loss(e_r, e_r1)
@@ -79,14 +79,19 @@ class Tasks(pl.LightningModule):
         Apply model to batch and compute loss.
         """
         # Forward pass
-        result_array, lambda_1, steps, sample_array = self.model.forward(batch)
+        result_array, lambda_1, steps, sample_array, T = self.model.forward(batch)
 
-        l11_loss = self.L11_loss(result_array, lambda_1, steps, sample_array)
+        l11_loss = self.L11_loss(result_array, lambda_1, steps, sample_array, T=T)
         mse_losses = [self.mse_loss(result_array[i], result_array[i + 1])
                   for i in range(len(result_array) - 1)]
         mse_loss = torch.stack(mse_losses).mean()
         
         final_loss = mse_loss - l11_loss
+        print(
+            f"mse={mse_loss.detach().item():.6f}, "
+            f"l11={l11_loss.detach().item():.6f}, "
+            f"final={final_loss.detach().item():.6f}"
+        )
     
         # Add validation checks
         if torch.isnan(final_loss) or torch.isinf(final_loss):
@@ -153,67 +158,59 @@ class Forecasting(Tasks):
         )
 
     def set_history(self, batch):
-        # Sample random start time for forecast window
         times = (
             torch.rand((len(batch),), device=batch.tmax.device)
             * (batch.tmax - 2 * self.model.forecast_window)
             + self.model.forecast_window
         )
-        # Get history, future, and bounds of forecast window
+
         history, future, forecast_end, forecast_start = batch.split_time(
             times, times + self.model.forecast_window
         )
+
+        if history.batch_size == 0 or future.batch_size == 0:
+            return future, forecast_end, forecast_start
+
         self.model.set_history(history)
         return future, forecast_end, forecast_start
 
     def training_step(self, batch, batch_idx):
         future, _, forecast_start = self.set_history(batch)
 
-        # rescale forecast to [0, T], same for inter-event times tau
+        if future.batch_size == 0:
+            self.log("train/empty_future_batch", 1, batch_size=1)
+            return None
+
         future.time = (
             (future.time - forecast_start[:, None]) / self.model.forecast_window
         ) * future.tmax
-        future.tau = (future.tau / (self.model.forecast_window)) * future.tmax
+        future.tau = (future.tau / self.model.forecast_window) * future.tmax
 
         loss = self.step(future, "train")
         return {"loss": loss}
 
     def validation_step(self, batch, batch_idx):
-        if self.global_step >= 1:
-            futures = []
-            samples = []
-            maes = []
-            # sample 5 forecast horizons per batch
-            for _ in range(5):
-                future, tmax, tmin = self.set_history(batch)
-                sample = self.model.sample(len(future), tmax=future.tmax)
-                # rescale and shift to right forecast window
-                sample.time = (sample.time / future.tmax) * (tmax - tmin)[
-                    :, None
-                ] + tmin[:, None]
-                samples = samples + sample.to_time_list()
-                futures = futures + future.to_time_list()
-                maes.append(
-                    torch.abs(future.mask.sum(-1) - sample.mask.sum(-1))
-                    / (future.mask.sum(-1) + 1)
-                )
+        with torch.no_grad():
+            future, tmax, tmin = self.set_history(batch)
+
+            if future.batch_size == 0:
+                self.log("val/empty_future_batch", 1, batch_size=1)
+                return
+
+            sample = self.model.sample(len(future), tmax=future.tmax)
+
+            sample.time = (sample.time / future.tmax) * (tmax - tmin)[:, None] + tmin[:, None]
+
+            maes = torch.abs(future.mask.sum(-1) - sample.mask.sum(-1)) / (future.mask.sum(-1) + 1)
 
             wasserstein = forecast_wasserstein(
-                samples,
-                futures,
+                sample.to_time_list(),
+                future.to_time_list(),
                 batch.tmax.detach().cpu().item(),
             )
 
-            self.log(
-                "val/MAE_counts",
-                torch.cat(maes).mean(),
-                batch_size=batch.batch_size,
-            )
-            self.log(
-                "val/forecast_wasserstein_distance",
-                wasserstein,
-                batch_size=batch.batch_size,
-            )
+            self.log("val/MAE_counts", maes.mean(), batch_size=batch.batch_size)
+            self.log("val/forecast_wasserstein_distance", wasserstein, batch_size=batch.batch_size)
 
     def test_step(self, batch, batch_idx):
         pass
@@ -234,26 +231,26 @@ class DensityEstimation(Tasks):
     def validation_step(self, batch, batch_idx):
         step = 2
         with torch.no_grad():
-            if self.global_step >= 1:
-                sample = self.model.sample(20, tmax=batch.tmax).to_time_list()
+            # if self.global_step >= 1:
+            sample = self.model.sample(20, tmax=batch.tmax).to_time_list()
 
-                mmd = MMD(
-                    sample,
-                    batch.to_time_list(),
-                    batch.tmax.detach().cpu().numpy(),
-                )[0]
-                wasserstein = lengths_distribution_wasserstein_distance(
-                    sample,
-                    batch.to_time_list(),
-                    batch.tmax.detach().cpu().numpy(),
-                    self.model.n_max,
-                )
-                self.log("val/sample_mmd", mmd, batch_size=batch.batch_size)
-                self.log(
-                    "val/sample_count_wasserstein",
-                    wasserstein,
-                    batch_size=batch.batch_size,
-                )
+            mmd = MMD(
+                sample,
+                batch.to_time_list(),
+                batch.tmax.detach().cpu().numpy(),
+            )[0]
+            wasserstein = lengths_distribution_wasserstein_distance(
+                sample,
+                batch.to_time_list(),
+                batch.tmax.detach().cpu().numpy(),
+                self.model.n_max,
+            )
+            self.log("val/sample_mmd", mmd, batch_size=batch.batch_size)
+            self.log(
+                "val/sample_count_wasserstein",
+                wasserstein,
+                batch_size=batch.batch_size,
+            )
 
     def test_step(self, batch, batch_idx):
         pass
