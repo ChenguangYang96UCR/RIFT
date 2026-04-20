@@ -513,6 +513,18 @@ class AddThin(DiffusionModell):
             DiTBlock(hidden_size, num_heads, mlp_ratio, dropout)
             for _ in range(depth)
         ])
+
+        # self.omega_head = nn.Sequential(
+        #     nn.Linear(self.number_patches, self.hidden_size),
+        #     nn.ReLU(),
+        #     nn.Linear(self.hidden_size, 1),
+        # )
+
+        self.omega_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, 1),
+        )
         
         self.final_layer = FinalLayer(patch_size, out_channels, hidden_size)
         
@@ -745,23 +757,13 @@ class AddThin(DiffusionModell):
             activations[f'dit_block_{i}'] = x
         
         # Apply final layer
-        x = self.final_layer(x, c)  # (B, num_patches, p*p*c)
-        activations['final_layer'] = x
+        # x = self.final_layer(x, c)  # (B, num_patches, p*p*c)
+        # activations['final_layer'] = x
         
-        # Flatten for MLP processing
-        x_flat = x.reshape(x.shape[0], -1)
-        
-        # Apply final MLP
-        # print(f"DiT_MLP shape , x_flat.shape[1]: {x_flat.shape[1]}, x_flat.shape[0]: {x_flat.shape[0]} data_length : {data_length}")
-        mlp = DiT_MLP(x_flat.shape[1], data_length, 1).to(device)
-        if train:
-            mlp.train()
-        else:
-            mlp.eval()
-        
-        e_new = mlp(x_flat)
-        scalar = e_new.mean(dim=1).mean()        
-        return scalar
+        x_feat = x.squeeze(1)          # [1, 9]
+        raw = self.omega_head(x_feat)  # [1, 1]
+        return raw.squeeze(-1).mean()    
+        # return scalar
 
     def lambda_0_hat(e_bar, e_0, bandwidth_square):
             kernel_values = np.exp(-((e_bar.reshape((-1, 1)) - e_0.reshape((1, -1))) **2 ) / (bandwidth_square))
@@ -981,6 +983,7 @@ class AddThin(DiffusionModell):
                     torch.tensor([index], device=device),
                     self.hidden_size
                 )
+
                 result = self.DiT(batch_e, time_embeding.to(device), dt)
                 batrch_result_array.append(result)
             sample_result_rk_array.append(batrch_result_array)
@@ -1112,158 +1115,28 @@ class AddThin(DiffusionModell):
                         torch.tensor([step], device=device),
                         self.hidden_size
                     )
-                omega_k_minus_1 = self.DiT(batch_e, time_emb[batch_index].to(device), dt)
+                raw = self.DiT(batch_e, time_emb[batch_index].to(device), dt)
+                omega_k_minus_1 = 1.0 + torch.sigmoid(raw)
+                print("raw", raw.item(), "omega", omega_k_minus_1.item())
+                # omega_k_minus_1 = torch.clamp(omega_k_minus_1, max=1.2)
+                # print("step", step, "raw", raw.item(), "omega", omega_k_minus_1.item())
                 omega_list.append(omega_k_minus_1)
 
              # 3. Using omega value to scale sample the x_0 value
             x_n_1 = self.backward_sample(x_n, lambda_1_batch, omega_list)
             x_n = x_n_1
             omega_batch = torch.stack(omega_list).to(lambda_1_batch.device)
+            # print(
+            #     f"step={step}, "
+            #     f"omega min={omega_batch.min().item():.6f}, "
+            #     f"max={omega_batch.max().item():.6f}, "
+            #     f"mean={omega_batch.mean().item():.6f}"
+            # )
             lambda_1_batch = lambda_1_batch * omega_batch
 
         x_0 = x_n
         return x_0
 
-
-    # def sample(self, n_samples: int, tmax) -> Batch:
-    #     """
-    #     Sample x_0 from ADD-THIN starting from x_N.
-
-    #     Parameters
-    #     ----------
-    #     n_samples : int
-    #         Number of samples
-    #     tmax : float
-    #         T of the temporal point process
-    #     begin_forecast : None, optional
-    #         Beginning of the forecast, by default None
-    #     end_forecast : None, optional
-    #         End of the forecast, by default None
-
-    #     Returns
-    #     -------
-    #     Batch
-    #         Sampled x_0s
-    #     """
-    #     # Init x_N by sampling from HPP
-    #     x_N = generate_hpp(tmax=tmax, n_sequences=n_samples)
-    #     # print('x-n size: ')
-    #     # print(x_N.time.size())
-    #     x_n_1 = x_N
-
-    #     # Sample x_N-1, ..., x_1 by applying posterior
-    #     for n_int in range(self.steps - 1, 0, -1):
-    #         n = torch.full(
-    #             (n_samples,), n_int, device=tmax.device, dtype=torch.long
-    #         )
-    #         x_n_1 = self.sample_posterior(x_n=x_n_1, n=n)
-
-    #     # Sample x_0
-    #     n = torch.full(
-    #         (n_samples,), n_int - 1, device=tmax.device, dtype=torch.long
-    #     )
-    #     x_0, x_classifed, sampled_x_0, classified_not_x_0 = self.sample_x_0(n=n, x_n=x_n_1)
-
-    #     alpha_n = self.get_n(
-    #         min=0,
-    #         max=self.steps,
-    #         shape=(len(x_0),),
-    #         device=x_0.time.device,
-    #     )
-    #     x_0_kept, x_0_thinned = x_0.thin(alpha=self.alpha_cumprod[alpha_n])
-    #     x_n = x_0_kept.add_events(x_N)
-    #     self.temp_x_N = x_n
-
-    #     return x_0
-
-    # def sample_x_0(
-    #     self, n: TensorType[int], x_n: Batch
-    # ) -> Tuple[Batch, Batch, Batch, Batch]:
-    #     """
-    #     Sample x_0 from x_n by classifying the intersection of x_0 and x_n and sampling from the intensity.
-
-    #     Parameters
-    #     ----------
-    #     n : TensorType[int]
-    #         Diffusion time steps
-    #     x_n : Batch
-    #         Batch of data
-
-    #     Returns
-    #     -------
-    #     Tuple[Batch, Batch, Batch, Batch]
-    #         x_0, classified_x_0, sampled_x_0, classified_not_x_0
-    #     """
-    #     (
-    #         dif_time_emb,
-    #         time_emb,
-    #         event_emb,
-    #     ) = self.compute_emb(n=n, x_n=x_n)
-
-    #     # Sample x_0\x_n from intensity
-    #     sampled_x_0 = self.intensity_model.sample(
-    #         event_emb=event_emb,
-    #         dif_time_emb=dif_time_emb,
-    #         n_samples=1,
-    #         x_n=x_n,
-    #     )
-
-    #     # Classify (x_0 ∩ x_n) from x_n
-    #     x_n_and_x_0_logits = self.classifier_model(
-    #         dif_time_emb=dif_time_emb, time_emb=time_emb, event_emb=event_emb
-    #     )
-    #     classified_x_0, classified_not_x_0 = x_n.thin(
-    #         alpha=x_n_and_x_0_logits.sigmoid()
-    #     )
-    #     return (
-    #         classified_x_0.add_events(sampled_x_0),
-    #         classified_x_0,
-    #         sampled_x_0,
-    #         classified_not_x_0,
-    #     )
-
-    # def sample_posterior(self, x_n: Batch, n: TensorType[int]) -> Batch:
-    #     """
-    #     Sample x_n-1 from x_n by predicting x_0 and then sampling from the posterior.
-
-    #     Parameters
-    #     ----------
-    #     x_n : Batch
-    #         Batch of data
-    #     n : TensorType
-    #         Diffusion time steps
-
-    #     Returns
-    #     -------
-    #     Batch
-    #         x_n-1
-    #     """
-    #     # Sample x_0 and x_n\x_0
-    #     _, classified_x_0, sampled_x_0, classified_not_x_0 = self.sample_x_0(
-    #         n=n, x_n=x_n
-    #     )
-
-    #     # Sample C
-    #     x_0_kept, _ = sampled_x_0.thin(alpha=self.alpha_x0_kept[n - 1])
-
-    #     # Sample D
-    #     hpp = generate_hpp(
-    #         tmax=x_n.tmax,
-    #         n_sequences=x_n.batch_size,
-    #         intensity=self.add_remove[n - 1],
-    #     )
-
-    #     # Sample E
-    #     x_n_kept, _ = classified_not_x_0.thin(alpha=self.alpha_xn_kept[n - 1])
-
-    #     # Superposition of B, C, D, E to attain x_n-1
-    #     x_n_1 = (
-    #         classified_x_0.add_events(hpp)
-    #         .add_events(x_n_kept)
-    #         .add_events(x_0_kept)
-    #     )
-    #     return x_n_1
-    
 
     # ! When use this function, make sure have already use model function create a temporary x_N
     def get_x_N(self):

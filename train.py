@@ -34,15 +34,27 @@ from add_thin.utils import (
 
 def get_callbacks(config):
     monitor = {"monitor": config.task.metric, "mode": "min"}
+
+    best_ckpt_cb = WandbModelCheckpoint(
+        save_last=True,
+        save_top_k=1,
+        every_n_epochs=1,
+        filename="best",
+        **monitor,
+    )
+
+    periodic_ckpt_cb = WandbModelCheckpoint(
+        save_last=False,
+        save_top_k=-1,
+        every_n_epochs=100,
+        filename="epoch{epoch:06d}",
+        monitor=None,
+    )
+
     callbacks = [
         WandbSummaries(config, **monitor),
-        WandbModelCheckpoint(
-            save_last=True,
-            save_top_k=1,
-            every_n_epochs=1,
-            filename="best",
-            **monitor,
-        ),
+        best_ckpt_cb,
+        periodic_ckpt_cb,
         TQDMProgressBar(refresh_rate=1),
     ]
 
@@ -55,8 +67,8 @@ def get_callbacks(config):
             **monitor,
         )
         callbacks.append(stopper)
-    return callbacks
 
+    return callbacks, best_ckpt_cb, periodic_ckpt_cb
 
 # Log to traceback to stderr on segfault
 faulthandler.enable(all_threads=False)
@@ -118,7 +130,7 @@ def main(config: DictConfig):
     log_hyperparameters(logger, config, model)
 
     log.info("Loading checkpoint")
-    callbacks = get_callbacks(config)
+    callbacks, best_ckpt_cb, periodic_ckpt_cb = get_callbacks(config)
 
     log.info("Instantiating trainer")
 
@@ -137,9 +149,16 @@ def main(config: DictConfig):
         log.info("Starting testing!")
         trainer.test(ckpt_path="best", datamodule=datamodule)
 
-    log.info(
-        f"Best checkpoint path:\n{trainer.checkpoint_callback.best_model_path}"
-    )
+    log.info(f"Best checkpoint path:\n{best_ckpt_cb.best_model_path}")
+
+    periodic_paths = sorted(periodic_ckpt_cb.best_k_models.keys())
+
+    if periodic_paths:
+        log.info("Periodic checkpoint paths:")
+        for p in periodic_paths:
+            log.info(p)
+    else:
+        log.info("No periodic checkpoints were saved.")
 
     best_score = trainer.checkpoint_callback.best_model_score
     wandb.finish()

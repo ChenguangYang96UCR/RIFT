@@ -628,7 +628,7 @@ class DataModule(pl.LightningDataModule):
             self.train_data,
             batch_size=self.batch_size,
             collate_fn=Batch.from_sequence_list,
-            num_workers=0,
+            num_workers=4,
             shuffle=True,
         )
 
@@ -637,7 +637,7 @@ class DataModule(pl.LightningDataModule):
             self.val_data,
             batch_size=min(self.batch_size, 16),   # 或者直接设成 config 里的 val_batch_size
             collate_fn=Batch.from_sequence_list,
-            num_workers=0,
+            num_workers=4,
             shuffle=False,
             drop_last=False,
             pin_memory=True,
@@ -648,7 +648,7 @@ class DataModule(pl.LightningDataModule):
             self.test_data,
             batch_size=len(self.test_data),  # evaluate all at once
             collate_fn=Batch.from_sequence_list,
-            num_workers=0,
+            num_workers=4,
             drop_last=False,
         )
 

@@ -61,11 +61,33 @@ class Tasks(pl.LightningModule):
     
     def L11_loss(self, result_array, lambda_1, K, sample_array, M = 100, T = 24):    
         # First term
+        print(
+            "result array min/max/mean/std:",
+            result_array.min().item(),
+            result_array.max().item(),
+            result_array.mean().item(),
+            result_array.std().item(),
+        )
+        
         term1 = result_array.mean() / K
 
         # Second term
         #TODO add one time sample array
+        print(
+            "sample_array min/max/mean/std:",
+            sample_array.min().item(),
+            sample_array.max().item(),
+            sample_array.mean().item(),
+            sample_array.std().item(),
+        )
         inner = sample_array.mean(dim=1).squeeze(-1) / K
+        print(
+            "inner raw min/max/mean:",
+            inner.min().item(),
+            inner.max().item(),
+            inner.mean().item(),
+        )
+        inner = torch.clamp(inner, min=-20, max=20)
         exp_term = torch.exp(inner)
         term2 = (lambda_1 * T / M) * exp_term.mean()
         return (term1 - term2).to(result_array.device)
@@ -87,6 +109,11 @@ class Tasks(pl.LightningModule):
         mse_loss = torch.stack(mse_losses).mean()
         
         final_loss = mse_loss - l11_loss
+
+        # final_loss = l11_loss - mse_loss
+        # alpha = 1.0
+        # beta = 0.1
+        # final_loss = alpha * mse_loss - beta * l11_loss
         print(
             f"mse={mse_loss.detach().item():.6f}, "
             f"l11={l11_loss.detach().item():.6f}, "
@@ -132,7 +159,7 @@ class Tasks(pl.LightningModule):
         )
 
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, factor=0.5, patience=500, verbose=True
+            opt, factor=0.5, patience=10, verbose=True
         )
 
         return {

@@ -44,6 +44,9 @@ def get_task(path, density=True, data_root="/path/to/data"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     task.to(device)
     task.eval()
+    first_param = next(task.model.parameters()).detach().flatten()[:10].cpu()
+    print("ckpt:", model_path)
+    print("first param:", first_param)
 
     return task, datamodule
 
